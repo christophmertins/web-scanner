@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan-Galerie</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,sans-serif;background:#0f141b;color:#dfe7ef}
+.wrap{max-width:1200px;margin:0 auto;padding:32px 20px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+h1{font-size:22px;margin:0}
+a{color:#3ea6ff;text-decoration:none}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
+.card{background:#171e28;border:1px solid #2a3646;border-radius:10px;padding:10px;display:flex;flex-direction:column}
+.card img{width:100%;height:160px;object-fit:cover;border-radius:6px;background:#1d2632}
+.card .name{font-size:13px;margin:8px 0 4px;word-break:break-all}
+.card .meta{font-size:12px;color:#8b98a8}
+.card.pdf{display:flex;align-items:center;justify-content:center;height:160px;font-size:14px;color:#8b98a8;background:#1d2632;border-radius:6px}
+.plbtn{margin-top:auto;align-self:flex-start;background:#1d2632;border:1px solid #2a3646;color:#dfe7ef;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;text-align:left}
+.plbtn:hover{border-color:#3ea6ff}
+.plbtn[disabled]{opacity:.5;cursor:not-allowed}
+.plmsg{font-size:12px;margin-top:6px;min-height:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><h1>📠 Scan-Galerie</h1><a href="/">← Züruck</a></header>
+<div class="grid" id="grid">Lädt…</div>
+</div>
+<script>
+let plOk = false;
+let cardFiles = [];
+
+function render(files){
+  cardFiles = files;
+  const g=document.getElementById('grid');
+  if(!files.length){g.textContent='Noch keine Scans.';return;}
+  g.innerHTML=files.map((f,i)=>{
+    const isImg=/\.(jpe?g|png)$/i.test(f.name);
+    const showThumb = isImg || f.thumb;
+    const media = showThumb
+      ? '<a href="/scans/'+f.name+'" target="_blank"><img src="/scans/thumb_'+f.name+'"></a>'
+      : '<a href="/scans/'+f.name+'"><div class="card pdf" style="border:none;height:160px">📄 PDF</div></a>';
+    const pages = (f.pages ? ' · '+f.pages+' Seite'+(f.pages===1?'':'n') : '');
+    const plb = (plOk ? (f.paperless_id
+      ? '<div class="plmsg" style="color:#37d67a;">✓ Paperless ('+String(f.paperless_id).slice(0,8)+')</div>'+
+        '<button class="plbtn" data-i="'+i+'">→ Erneut senden</button><div class="plmsg"></div>'
+      : '<button class="plbtn" data-i="'+i+'">→ An Paperless senden</button><div class="plmsg"></div>') : '');
+    return '<div class="card">'+
+      media+
+      '<div class="name"><a href="/scans/'+f.name+'" target="_blank">'+f.name+'</a></div>'+
+      '<div class="meta">'+Math.round(f.size/1024)+' kB · '+new Date(f.mtime*1000).toLocaleString()+pages+'</div>'+
+      plb+
+      '</div>';
+  }).join('');
+  if(plOk){
+    document.querySelectorAll('.plbtn').forEach(b=>{
+      b.addEventListener('click', ()=>toPaperless(files[+b.dataset.i].name, b));
+    });
+  }
+}
+
+async function toPaperless(name, btn){
+  const msg = btn.nextElementSibling;
+  btn.disabled = true; btn.textContent = 'Sende…'; msg.textContent = '';
+  try{
+    const r = await fetch('/api/paperless/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:name})}).then(r=>r.json());
+    if(r.error){ msg.textContent = 'Fehler: '+r.error; msg.style.color = '#ff5c5c'; }
+    else {
+      msg.textContent = 'OK → '+ (r.file||name) + (r.id? ' (#'+String(r.id).slice(0,8)+')' : ''); msg.style.color = '#37d67a';
+      const f = cardFiles[+btn.dataset.i];
+      if(f && r.id){ f.paperless_id = r.id; f.paperless_ts = Date.now()/1000; }
+      render(cardFiles);
+    }
+  }catch(e){
+    msg.textContent = 'Fehler: '+e.message; msg.style.color = '#ff5c5c';
+  }finally{
+    btn.disabled = false; btn.textContent = '→ An Paperless senden';
+  }
+}
+
+Promise.all([
+  fetch('/scans/').then(r=>r.json()),
+  fetch('/api/config').then(r=>r.json()).then(c=>c.paperless||false).catch(()=>false)
+]).then(([r, ok])=>{ plOk=!!ok; render(r.files||[]); })
+  .catch(()=>{ document.getElementById('grid').textContent='Fehler beim Laden.'; });
+</script>
+</body>
+</html>

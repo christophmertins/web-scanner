@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scanner Web</title>
+<style>
+:root{
+  --bg:#0f141b; --panel:#171e28; --panel2:#1d2632; --border:#2a3646;
+  --text:#dfe7ef; --muted:#8b98a8; --acc:#3ea6ff; --ok:#37d67a; --err:#ff5c5c;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 20px}
+h1{font-size:22px;margin:8px 0 24px;display:flex;align-items:center;gap:10px}
+h1 small{color:var(--muted);font-weight:400;font-size:13px}
+.layout{display:grid;grid-template-columns:300px 1fr;gap:20px}
+@media(max-width:760px){.layout{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px}
+.panel h2{font-size:14px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:0 0 14px}
+label{display:block;font-size:13px;color:var(--muted);margin:12px 0 6px}
+select,input[type=number]{width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 10px;font-size:14px}
+.badge{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:1px 8px;font-size:12px;color:var(--muted)}
+.status{font-size:13px;padding:10px 12px;border-radius:8px;margin-top:14px;display:none}
+.status.show{display:block}
+.status.ok{background:#12351f;border:1px solid #1f5c38;color:var(--ok)}
+.status.err{background:#3a1720;border:1px solid #6b2233;color:var(--err)}
+.status.info{background:#10202f;border:1px solid #1e3a55;color:var(--acc)}
+.btn{display:inline-block;border:none;border-radius:8px;padding:12px 18px;font-size:15px;cursor:pointer;font-weight:600}
+.btn-primary{background:var(--acc);color:#04121f}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-ghost{background:var(--panel2);color:var(--text);border:1px solid var(--border)}
+.btn-gap{margin-top:16px}
+.result{margin-top:20px;display:none}
+.result.show{display:block}
+.result img{max-width:100%;max-height:500px;border-radius:8px;border:1px solid var(--border)}
+.result .row{display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap}
+a.download{color:var(--acc);text-decoration:none;font-weight:600}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.meta{font-size:12px;color:var(--muted);margin-top:4px}
+.spin{display:none;width:16px;height:16px;border:2px solid rgba(255,255,255,.3);border-top-color:var(--acc);border-radius:50%;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1><span>📠</span> HP Scanner Web <small id="devlabel">–</small></h1>
+<div class="layout">
+  <div>
+    <div class="panel" id="scanpanel" style="display:none">
+      <h2>Neuer Scan</h2>
+      <label>Gerät</label>
+      <select id="device"></select>
+      <label>Scan-Quelle</label>
+      <select id="source" onchange="onSourceChange()"></select>
+      <div class="meta" id="sourceHint" style="display:none">Bei ADF wird komplett durchgezogen und als PDF zusammengefasst.</div>
+      <label>Modus</label>
+      <select id="mode"></select>
+      <label>Auflösung</label>
+      <select id="resolution"></select>
+      <label>Format</label>
+      <select id="format">
+        <option value="pdf" selected>PDF (mehrseitig)</option>
+        <option value="jpeg">JPEG</option>
+        <option value="png">PNG</option>
+      </select>
+      <label>Scanbereich</label>
+      <select id="area">
+        <option value="a4" selected>A4 (210 × 297 mm)</option>
+        <option value="max">Maximal</option>
+      </select>
+      <button class="btn btn-primary btn-gap" id="scanbtn" onclick="startScan()">
+        <span id="scanlbl">Scan starten</span>
+      </button>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:16px">
+        <input type="checkbox" id="autoscan" checked onchange="setAuto()">
+        Auto-Scan (ADF)
+        <span class="meta">Startet automatisch beim Einlegen.</span>
+      </label>
+      <div class="status" id="status"></div>
+    </div>
+    <div class="panel" id="waitpanel" style="display:none">
+      <div class="spin" style="display:block;margin:0 auto"></div>
+      <p style="text-align:center;color:var(--muted);margin:12px 0 0;font-size:14px">Suche nach Scanner…</p>
+    </div>
+  </div>
+  <div>
+    <div class="panel" id="sesspanel" style="display:none">
+      <h2>Mehrseitiger PDF-Scan</h2>
+      <div class="status info show" id="sessinfo"></div>
+      <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+        <button class="btn btn-ghost" onclick="nextPage()">Nächste Seite</button>
+        <button class="btn btn-primary" onclick="finishPdf()">PDF speichern</button>
+        <button class="btn btn-ghost" onclick="sendToPaperless()" id="plbtn2" style="display:none">An Paperless senden</button>
+        <button class="btn btn-ghost" onclick="cancelJob()">Abbrechen</button>
+      </div>
+      <div id="pages" class="toolbar" style="margin-top:14px"></div>
+    </div>
+    <div class="panel" id="singlepanel" style="display:none">
+      <h2>Fertig</h2>
+      <div class="toolbar" style="align-items:center">
+        <a href="#" id="dl" class="download">Download</a>
+        <button class="btn btn-ghost" onclick="sendToPaperless()" id="plbtn" style="display:none">An Paperless senden</button>
+      </div>
+      <img id="preview" alt="Scan-Vorschau">
+    </div>
+    <div class="panel">
+      <h2>Zuletzt gescannt <a href="/gallery" style="float:right;font-size:12px;color:var(--acc)">Galerie →</a></h2>
+      <div id="automsg" style="display:none"></div>
+      <div id="history" style="font-size:13px;color:var(--muted)">Wird geladen…</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+let cfg = {device:null, options:null, session:null};
+let lastFile = null;
+let paperlessOk = false;
+
+async function j(url, opts){ const r = await fetch(url, opts); return r.json(); }
+
+function setStatus(cls, txt){
+  const s = document.getElementById('status');
+  s.className = 'status show ' + cls;
+  s.textContent = txt;
+}
+
+async function init(){
+  const c = await j('/api/config');
+  if(c.error){ document.getElementById('waitpanel').style.display='none';
+    document.getElementById('scanpanel').style.display='block';
+    setStatus('err', c.error); return; }
+  cfg.device = c.device;
+  paperlessOk = !!c.paperless;
+  document.getElementById('autoscan').checked = (c.autoscan && c.autoscan.enabled !== false);
+  document.getElementById('devlabel').textContent = c.device;
+  document.getElementById('waitpanel').style.display='none';
+  document.getElementById('scanpanel').style.display='block';
+  const o = c.options || {};
+  const devsel = document.getElementById('device');
+  if(!o.modes || !o.modes.length){
+    const d = await j('/api/devices');
+    d.devices.forEach(dd => { devsel.add(new Option(dd.desc, dd.id)); });
+    if(d.devices.length) cfg.device = d.devices[0].id;
+  }
+  fillSelect('mode', o.modes || ['Color','Gray'], 'Color');
+  fillSelect('resolution', (o.resolutions||[100,200,300]).map(String), '300');
+  const srcs = (o.sources && o.sources.length) ? o.sources : ['Auto','Flatbed'];
+  fillSelect('source', srcs, srcs.includes('Auto') ? 'Auto' : srcs[0]);
+  setStatus('info', 'Scanner bereit: ' + c.device);
+}
+
+function fillSelect(id, values, def){
+  const s = document.getElementById(id);
+  s.innerHTML = '';
+  values.forEach(v => { s.add(new Option(v, v)); });
+  s.value = def;
+}
+
+function onSourceChange(){
+  const hint = document.getElementById('sourceHint');
+  const isAdf = document.getElementById('source').value === 'ADF';
+  hint.style.display = isAdf ? 'block' : 'none';
+  if(isAdf){
+    document.getElementById('format').value = 'pdf';
+    document.getElementById('format').disabled = true;
+  }else{
+    document.getElementById('format').disabled = false;
+  }
+}
+
+async function areaSize(){
+  if(document.getElementById('area').value==='max' && cfg.options && cfg.options.max_x){
+    return {w: cfg.options.max_x, h: cfg.options.max_y};
+  }
+  return {w: 210, h: 297};
+}
+
+async function startScan(){
+  if(cfg.session) return;
+  lastFile = null;
+  document.getElementById('plbtn').style.display='none';
+  document.getElementById('singlepanel').style.display='none';
+  const s = document.getElementById('source').value;
+  const body = {
+    device: cfg.device,
+    mode: document.getElementById('mode').value,
+    resolution: +document.getElementById('resolution').value,
+    source: s,
+    format: document.getElementById('format').value,
+    ...await areaSize()
+  };
+  const btn = document.getElementById('scanbtn'), lbl = document.getElementById('scanlbl');
+  btn.disabled = true; lbl.textContent = 'Scan läuft…';
+  setStatus('info', s === 'ADF' ? 'Scanne ADF… bitte warten.' : 'Scanne… bitte warten (Scanner kann mehrere Sekunden brauchen).');
+  const r = await j('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  btn.disabled = false; lbl.textContent = 'Scan starten';
+  if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
+
+  if(r.adf){
+    lastFile = r.file;
+    document.getElementById('singlepanel').style.display='block';
+    document.getElementById('dl').href = r.url;
+    document.getElementById('dl').textContent = 'Download ' + r.file;
+    document.getElementById('preview').style.display = 'none';
+    document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+    setStatus('ok', 'ADF-Scan mit ' + (r.pages||0) + ' Seiten fertig.');
+    loadHistory();
+    return;
+  }
+
+  if(r.session){
+    cfg.session = r.session;
+    document.getElementById('singlepanel').style.display='none';
+    document.getElementById('sesspanel').style.display='block';
+    document.getElementById('sessinfo').textContent = 'Seite 1 gescannt. Weitere Seiten einlegen und „Nächste Seite“ klicken.';
+    document.getElementById('pages').innerHTML = '<span class="badge">1 Seite</span>';
+    showPreview(r.preview);
+    setStatus('ok', 'Seite 1 fertig.');
+  } else {
+    lastFile = r.file;
+    document.getElementById('singlepanel').style.display='block';
+    document.getElementById('dl').href = r.url;
+    document.getElementById('dl').textContent = 'Download ' + r.file;
+    document.getElementById('preview').style.display = 'block';
+    document.getElementById('preview').src = r.thumb;
+    document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+    setStatus('ok', 'Scan fertig.');
+    loadHistory();
+  }
+}
+
+async function nextPage(){
+  if(!cfg.session) return;
+  const btn = document.querySelector('#sesspanel .btn-primary');
+  btn.disabled = true; btn.textContent = 'Scannt…';
+  setStatus('info', 'Scanne nächste Seite…');
+  const r = await j('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({session: cfg.session})});
+  btn.disabled = false; btn.textContent = 'PDF speichern';
+  if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
+  document.getElementById('sessinfo').textContent = 'Seite '+r.pages+' hinzugefügt.';
+  document.getElementById('pages').innerHTML = '<span class="badge">'+r.pages+' Seiten</span>';
+  showPreview(r.preview);
+  setStatus('ok', 'Seite '+r.pages+' fertig.');
+}
+
+async function finishPdf(){
+  if(!cfg.session) return;
+  setStatus('info', 'Erstelle PDF…');
+  const r = await j('/api/finish', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({session: cfg.session})});
+cfg.session = null;
+  if(r.error){ setStatus('err', 'Fehler: ' + r.error);
+    document.getElementById('singlepanel').style.display='none';
+    return; }
+  lastFile = r.file;
+  document.getElementById('singlepanel').style.display='block';
+  document.getElementById('dl').href = r.url;
+  document.getElementById('dl').textContent = 'Download ' + r.file;
+  document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+  setStatus('ok', 'PDF mit '+r.pages+' Seiten erstellt.');
+  loadHistory();
+}
+
+async function sendToPaperless(){
+  if(!lastFile){ setStatus('err', 'Keine Datei vorhanden.'); return; }
+  const btn = document.getElementById('plbtn');
+  btn.disabled = true;
+  setStatus('info', 'Sende an Paperless…');
+  try{
+    const r = await j('/api/paperless/send', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({file: lastFile})});
+    if(r.error){ setStatus('err', 'Paperless: ' + r.error); return; }
+    const name = r.file || lastFile;
+    setStatus('ok', 'An Paperless gesendet: ' + name + (r.id ? ' (Dokument #' + r.id + ')' : '.'));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function cancelJob(){
+  if(cfg.session){
+    await j('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session: cfg.session})});
+    cfg.session = null;
+  }
+  lastFile = null;
+  document.getElementById('sesspanel').style.display='none';
+  document.getElementById('singlepanel').style.display='none';
+  setStatus('info', 'Abgebrochen.');
+}
+
+async function showPreview(url){
+  const p = document.getElementById('preview');
+  p.src = url;
+  document.getElementById('dl').style.display='none';
+}
+
+async function loadHistory(){
+  const h = document.getElementById('history');
+  try{
+    const r = await j('/scans/');
+    const files = r.files||[];
+    if(!files.length){ h.textContent = 'Noch keine Scans.'; return; }
+    h.innerHTML = files.slice(0,8).map(f =>
+      '<div style="padding:6px 0;border-bottom:1px solid var(--border)">'+
+      '<a class="download" href="/scans/'+f.name+'">'+f.name+'</a>'+
+      (f.paperless_id ? ' <span style="color:#37d67a;font-size:12px">✓ Paperless</span>' : '')+
+      (paperlessOk ? ' <a href="#" class="download" style="font-size:12px" onclick="sendNamedToPaperless(event, \''+f.name+'\')">→ Paperless</a>' : '')+
+      '<div class="meta">'+Math.round(f.size/1024)+' kB · '+new Date(f.mtime*1000).toLocaleString()+
+      (f.pages ? ' · '+f.pages+' Seite'+(f.pages===1?'':'n') : '')+'</div></div>'
+    ).join('');
+  }catch(e){ h.textContent = 'Fehler beim Laden.'; }
+}
+
+async function sendNamedToPaperless(e, name){
+  e.preventDefault();
+  setStatus('info', 'Sende an Paperless…');
+  const r = await j('/api/paperless/send', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({file: name})});
+  if(r.error){ setStatus('err', 'Paperless: ' + r.error); return; }
+  const got = r.file || name;
+  setStatus('ok', 'An Paperless gesendet: ' + got + (r.id ? ' (Dokument #' + String(r.id).slice(0,8) + ')' : '.'));
+}
+
+async function setAuto(){
+  await j('/api/autoscan', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: document.getElementById('autoscan').checked})});
+}
+
+let autolastShown = 0;
+async function pollAuto(){
+  let r;
+  try{ r = await j('/api/autoscan'); }catch(e){ return; }
+  if(r.last && r.last.ts > autolastShown){
+    autolastShown = r.last.ts;
+    const a = document.getElementById('automsg');
+    a.style.display = 'block';
+    a.innerHTML = '<div style="padding:8px 10px;border:1px solid #1f5c38;background:#12351f;border-radius:8px;margin-bottom:10px;font-size:13px;color:#37d67a">'+
+      'Auto-Scan: <a class="download" href="/scans/'+r.last.file+'">'+r.last.file+'</a>'+
+      ' ('+r.last.pages+' Seite'+(r.last.pages===1?'':'n')+')'+
+      (paperlessOk ? ' <a href="#" class="download" onclick="sendNamedToPaperless(event, \''+r.last.file+'\')">→ Paperless</a>' : '')+
+      '</div>';
+    loadHistory();
+  } else if(r.last && autolastShown === 0){
+    autolastShown = r.last.ts;
+  }
+}
+
+init(); loadHistory();
+setInterval(pollAuto, 2500);
+</script>
+</body>
+</html>

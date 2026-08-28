@@ -1,0 +1,23 @@
+services:
+  scanner:
+    build: .
+    container_name: hp-scanner-web
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # IP/Modell des HP Officejet 4500 (optional, wird sonst auto-erkannt)
+      - SCANNER_IP=${SCANNER_IP:-192.168.1.107}
+      - SCANNER_DEVICE=${SCANNER_DEVICE:-hpaio:/net/officejet_4500_g510n-z?ip=192.168.1.107&queue=false}
+      # optional: Zugangsschutz fuer die Webanwendung (.env)
+      - AUTH_USER=${AUTH_USER:-}
+      - AUTH_PASS=${AUTH_PASS:-}
+      # optional: Paperless-ngx (Upload "An Paperless senden"), Werte in .env
+      - PAPERLESS_URL=${PAPERLESS_URL:-}
+      - PAPERLESS_TOKEN=${PAPERLESS_TOKEN:-}
+    volumes:
+      - ./scans:/scans
+      - ./app:/app/app
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
