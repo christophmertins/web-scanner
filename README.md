@@ -44,7 +44,7 @@ versioniert wird. Gerätespezifische Werte stehen in `docker-compose.yml`.
 
 Paperless: Nach einem Scan erscheint der Button „An Paperless senden“
 (Upload über die Paperless-API; je moderat, danach übernimmt Paperless OCR/Ablage).
-Konfiguriert ist `PAPERLESS_URL=https://paperless.haenf.duckdns.org` (valid
+Konfiguriert ist eine `PAPERLESS_URL` (valid
 Let's-Encrypt-Wildcard-Cert über den lokalen nginx-proxy).
 
 Datum der Device-URI enthält ein `&` -> in YAML als `&amp;` escapen.

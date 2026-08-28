@@ -72,6 +72,16 @@ a.download{color:var(--acc);text-decoration:none;font-weight:600}
       <button class="btn btn-primary btn-gap" id="scanbtn" onclick="startScan()">
         <span id="scanlbl">Scan starten</span>
       </button>
+      <button class="btn btn-gap" id="duplexbtn" onclick="startDuplex()" style="display:none">
+        Duplex (2× ADF) – Vorder- &amp; Rückseite
+      </button>
+      <div class="panel" id="duplexpanel" style="display:none;margin-top:12px;padding:14px;font-size:14px">
+        <div id="duplexmsg"></div>
+        <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+          <button class="btn btn-primary" id="duplexbackbtn" onclick="duplexBack()" style="display:none">Rückseiten scannen</button>
+          <button class="btn btn-ghost" onclick="duplexCancel()">Abbrechen</button>
+        </div>
+      </div>
       <label style="display:flex;align-items:center;gap:8px;margin-top:16px">
         <input type="checkbox" id="autoscan" checked onchange="setAuto()">
         Auto-Scan (ADF)
@@ -144,10 +154,11 @@ async function init(){
     d.devices.forEach(dd => { devsel.add(new Option(dd.desc, dd.id)); });
     if(d.devices.length) cfg.device = d.devices[0].id;
   }
-  fillSelect('mode', o.modes || ['Color','Gray'], 'Color');
+  fillSelect('mode', o.modes || ['Color','Gray'], 'Gray');
   fillSelect('resolution', (o.resolutions||[100,200,300]).map(String), '300');
   const srcs = (o.sources && o.sources.length) ? o.sources : ['Auto','Flatbed'];
   fillSelect('source', srcs, srcs.includes('Auto') ? 'Auto' : srcs[0]);
+  onSourceChange();
   setStatus('info', 'Scanner bereit: ' + c.device);
 }
 
@@ -162,6 +173,8 @@ function onSourceChange(){
   const hint = document.getElementById('sourceHint');
   const isAdf = document.getElementById('source').value === 'ADF';
   hint.style.display = isAdf ? 'block' : 'none';
+  document.getElementById('duplexbtn').style.display = isAdf ? 'inline-block' : 'none';
+  if(!isAdf) duplexCancel();
   if(isAdf){
     document.getElementById('format').value = 'pdf';
     document.getElementById('format').disabled = true;
@@ -229,6 +242,67 @@ async function startScan(){
     setStatus('ok', 'Scan fertig.');
     loadHistory();
   }
+}
+
+let duplexSession = null;
+
+async function startDuplex(){
+  if(cfg.session || duplexSession) return;
+  duplexSession = null;
+  const body = {
+    device: cfg.device,
+    mode: document.getElementById('mode').value,
+    resolution: +document.getElementById('resolution').value,
+    ...await areaSize()
+  };
+  const btn = document.getElementById('duplexbtn');
+  btn.disabled = true; btn.textContent = 'Vorderseiten werden gescannt…';
+  setStatus('info', 'Duplex Schritt 1/2: Vorderseiten werden aus dem ADF gezogen…');
+  const r = await j('/api/duplex/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  btn.disabled = false; btn.textContent = 'Duplex (2× ADF) – Vorder- & Rückseite';
+  if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
+  duplexSession = r.session;
+  const panel = document.getElementById('duplexpanel');
+  panel.style.display = 'block';
+  document.getElementById('duplexmsg').innerHTML =
+    'Schritt 1/2 erledigt: <b>'+r.pages+'</b> Vorderseite'+(r.pages===1?'':'n')+' im ADF gezogen.<br>'+
+    'Jetzt den kompletten Stapel <b>umdrehen</b> (ohne Reihenfolge ändern) und wieder in den Einzug legen, '+
+    'dann Rückseiten scannen lassen.';
+  document.getElementById('duplexbackbtn').style.display = 'inline-block';
+}
+
+async function duplexBack(){
+  if(!duplexSession) return;
+  const btn = document.getElementById('duplexbackbtn');
+  btn.disabled = true; btn.textContent = 'Rückseiten werden gescannt…';
+  setStatus('info', 'Duplex Schritt 2/2: Rückseiten werden aus dem ADF gezogen…');
+  const r = await j('/api/duplex/back', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({session: duplexSession})});
+  duplexSession = null;
+  btn.disabled = false; btn.textContent = 'Rückseiten scannen';
+  document.getElementById('duplexpanel').style.display = 'none';
+  if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
+  lastFile = r.file;
+  document.getElementById('singlepanel').style.display='block';
+  document.getElementById('dl').href = r.url;
+  document.getElementById('dl').textContent = 'Download ' + r.file;
+  document.getElementById('preview').style.display = 'none';
+  document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+  setStatus('ok', 'Duplex-Scan mit ' + (r.pages||0) + ' Blättern ('+(r.duplex?'Vorder-/Rückseite): ' : '): ') +
+    'PDF fertig.' + (r.paperless ? ' ' + r.paperless : ''));
+  loadHistory();
+  if(r.paperless && r.paperless.startsWith('Paperless-Fehler')){
+    setStatus('err', r.paperless);
+  }
+}
+
+async function duplexCancel(){
+  if(duplexSession){
+    const s = duplexSession;
+    duplexSession = null;
+    try{ await j('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session: s})}); }catch(e){}
+  }
+  document.getElementById('duplexpanel').style.display = 'none';
 }
 
 async function nextPage(){

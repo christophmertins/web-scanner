@@ -6,14 +6,17 @@ services:
     network_mode: host
     environment:
       # IP/Modell des HP Officejet 4500 (optional, wird sonst auto-erkannt)
-      - SCANNER_IP=${SCANNER_IP:-192.168.1.107}
-      - SCANNER_DEVICE=${SCANNER_DEVICE:-hpaio:/net/officejet_4500_g510n-z?ip=192.168.1.107&queue=false}
+      - SCANNER_IP=${SCANNER_IP:-}
+      - SCANNER_DEVICE=${SCANNER_DEVICE:-}
       # optional: Zugangsschutz fuer die Webanwendung (.env)
       - AUTH_USER=${AUTH_USER:-}
       - AUTH_PASS=${AUTH_PASS:-}
       # optional: Paperless-ngx (Upload "An Paperless senden"), Werte in .env
       - PAPERLESS_URL=${PAPERLESS_URL:-}
       - PAPERLESS_TOKEN=${PAPERLESS_TOKEN:-}
+      # Timeouts in Sekunden (Default: Einzelscan 180, ADF-Stapel 300)
+      - SCAN_TIMEOUT=${SCAN_TIMEOUT:-180}
+      - ADF_TIMEOUT=${ADF_TIMEOUT:-300}
     volumes:
       - ./scans:/scans
       - ./app:/app/app

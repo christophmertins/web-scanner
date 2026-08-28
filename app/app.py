@@ -22,7 +22,8 @@ SCANNER_IP = os.environ.get("SCANNER_IP", "192.168.1.107")
 SCANNER_DEVICE = os.environ.get("SCANNER_DEVICE", "").strip()
 AUTH_USER = os.environ.get("AUTH_USER", "").strip()
 AUTH_PASS = os.environ.get("AUTH_PASS", "").strip()
-SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "120"))
+SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "180"))
+ADF_TIMEOUT = int(os.environ.get("ADF_TIMEOUT", "300"))
 
 PAPERLESS_URL = os.environ.get("PAPERLESS_URL", "").strip().rstrip("/")
 PAPERLESS_TOKEN = os.environ.get("PAPERLESS_TOKEN", "").strip()
@@ -64,6 +65,7 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
 scan_lock = threading.Lock()
 jobs = {}  # job_id -> {"device":..., "dir":..., "pages": [...]}
+duplex_jobs = {}  # job_id -> {"dir":..., "front_pages": [...], "ts":...}
 DEVICE_CACHE = {"ts": 0, "list": []}
 OPT_CACHE_FILE = os.path.join(SCAN_DIR, ".device_options.json")
 OPT_CACHE_TTL = 3600
@@ -77,6 +79,7 @@ auto_cfg = {
     "interval": AUTO_BASE_INTERVAL,
     "last": None,        # {"file":..., "pages":..., "ts":...}
     "state": "idle",     # idle | scanning | error
+    "paperless": bool(PAPERLESS_URL),   # ADF-Scans direkt an Paperless senden
 }
 last_ui_settings = {"mode": "Gray", "resolution": 300, "x": 210.0, "y": 297.0}
 
@@ -118,11 +121,23 @@ def log(msg):
 
 
 def run(cmd, timeout=SCAN_TIMEOUT):
-    """Run a command, return (rc, stdout, stderr)."""
+    """Run a command, return (rc, stdout, stderr).
+
+    Laeuft in einer eigenen Prozesssession (start_new_session), damit bei Timeout
+    der ganze Prozessbaum (inkl. HPLIP/hpaio-Helfer) gekillt wird. Andernfalls
+    bleibt das Netz-Geraet gesperrt und alle folgenden Scans haengen ebenfalls ab."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, start_new_session=True)
         return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
+        # Kind + Prozessbaum hart killen, damit das Gerat wieder freigegeben wird
+        try:
+            os.killpg(os.getpgid(e.pid), 9)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
         return -1, "", "timeout after %ss" % timeout
     except FileNotFoundError:
         return -2, "", "command not found"
@@ -235,6 +250,23 @@ def _opt_cache_warm(device):
         pass
 
 
+def normalize_mode(device, mode, opts):
+    """Fuehrt einen nicht vom Gerat akzeptierten Scan-Betriebsmodus auf einen
+    gultigen zuruck (z. B. 'Gray', wenn das Gerat nur 'Lineart|Color' kennt).
+    Ohne opts wird unveraendert zurueckgegeben."""
+    if not opts or not opts.get("modes"):
+        return mode
+    available = [m.lower() for m in opts["modes"]]
+    if mode and mode.lower() in available:
+        return mode
+    # Naechstbesten passenden Vorschlag, ansonsten Gerat-Default (erster Eintrag)
+    want = (mode or "Gray").lower()
+    for pref in ("gray", "grey", "monochrome", "normal", "color", "colour", "lineart", "photo"):
+        if pref in available and (pref in want or want in pref):
+            return next(m for m in opts["modes"] if m.lower() == pref)
+    return opts["modes"][0]
+
+
 def device_options(device):
     """Parse scanimage --help into structured options (gecacht, da der Probe ~15 s dauert)."""
     global _opt_cache
@@ -265,7 +297,13 @@ def scan_image(device, mode, resolution, source, fmt, width_mm, height_mm):
     out_path = tempfile.mktemp(suffix=".%s" % fmt, dir=JOB_DIR)
     sfmt = fmt
 
-    cmd = ["scanimage", "-d", device, "--mode", mode]
+    opts, _ = device_options(device)
+    mode = normalize_mode(device, mode, opts)
+    use_mode = bool(opts.get("modes")) and mode.lower() in [m.lower() for m in opts["modes"]]
+
+    cmd = ["scanimage", "-d", device]
+    if use_mode:
+        cmd += ["--mode", mode]
     if resolution:
         cmd += ["--resolution", str(resolution)]
     if source:
@@ -286,23 +324,36 @@ def scan_image(device, mode, resolution, source, fmt, width_mm, height_mm):
     return True, out_path, None
 
 
+def adf_scan_pages(device, mode, resolution, width_mm, height_mm, jdir):
+    """Ein kompletter ADF-Durchzug in jdir. Returns (ok, [png_paths], err)."""
+    opts, _ = device_options(device)
+    mode = normalize_mode(device, mode, opts)
+    use_mode = bool(opts.get("modes")) and mode.lower() in [m.lower() for m in opts["modes"]]
+    pattern = os.path.join(jdir, "page%d.png")
+    cmd = ["scanimage", "-d", device]
+    if use_mode:
+        cmd += ["--mode", mode]
+    cmd += ["--resolution", str(resolution), "--source", "ADF",
+            "--batch-scan=yes", "--batch=%s" % pattern, "--format", "png",
+            "--compression", "None",
+            "-x", "%.2f" % width_mm, "-y", "%.2f" % height_mm]
+    log("ADF running: %s" % " ".join(cmd))
+    with scan_lock:
+        rc, so, err = run(cmd, timeout=ADF_TIMEOUT)
+    pages = sorted(glob.glob(os.path.join(jdir, "page*.png")),
+                   key=lambda p: int(re.search(r"page(\d+)\.png", p).group(1)))
+    if not pages:
+        return False, None, "Keine Seiten gescannt. Ist Papier im ADF? (%s)" % (err.strip() or "rc=%s" % rc)
+    return True, pages, None
+
+
 def scan_adf(device, mode, resolution, width_mm, height_mm, fmt):
     """Scan all pages from the ADF in one continuous pass."""
     jdir = tempfile.mkdtemp(dir=JOB_DIR)
     try:
-        pattern = os.path.join(jdir, "page%d.png")
-        cmd = ["scanimage", "-d", device, "--mode", mode,
-               "--resolution", str(resolution), "--source", "ADF",
-               "--batch-scan=yes", "--batch=%s" % pattern, "--format", "png",
-               "--compression", "None",
-               "-x", "%.2f" % width_mm, "-y", "%.2f" % height_mm]
-        log("ADF running: %s" % " ".join(cmd))
-        with scan_lock:
-            rc, so, err = run(cmd, timeout=SCAN_TIMEOUT)
-        pages = sorted(glob.glob(os.path.join(jdir, "page*.png")),
-                       key=lambda p: int(re.search(r"page(\d+)\.png", p).group(1)))
-        if not pages:
-            return False, None, "Keine Seiten gescannt. Ist Papier im ADF? (%s)" % (err.strip() or "rc=%s" % rc), 0
+        ok, pages, err = adf_scan_pages(device, mode, resolution, width_mm, height_mm, jdir)
+        if not ok:
+            return False, None, err, 0
         if fmt == "pdf":
             dest = os.path.join(SCAN_DIR, "scan_%s.pdf" % time.strftime("%Y%m%d_%H%M%S"))
             try:
@@ -399,6 +450,13 @@ def cleanup_old_jobs(max_age=3600):
             except Exception:
                 pass
             jobs.pop(jid, None)
+    for jid, j in list(duplex_jobs.items()):
+        if now - j["ts"] > max_age:
+            try:
+                shutil_rmtree(j["dir"])
+            except Exception:
+                pass
+            duplex_jobs.pop(jid, None)
 
 
 def shutil_rmtree(d):
@@ -457,6 +515,57 @@ def mark_paperless(name, doc_id):
         log("mark paperless failed: %s" % e)
 
 
+def paperless_upload(name, title="", created=""):
+    """Eine gescannte Datei an Paperless-ngx ueber die API senden.
+    Returns (ok, err, doc_id)."""
+    if not PAPERLESS_URL:
+        return False, "Paperless ist nicht konfiguriert.", None
+    full = os.path.join(SCAN_DIR, name)
+    if not name or not os.path.isfile(full):
+        return False, "Datei nicht gefunden.", None
+
+    mime = "application/pdf" if name.lower().endswith(".pdf") else "image/%s" % (
+        "png" if name.lower().endswith(".png") else "jpeg")
+    headers = {}
+    if PAPERLESS_TOKEN:
+        headers["Authorization"] = "Token %s" % PAPERLESS_TOKEN
+
+    if not created:
+        created = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    payload = {"title": title or name, "created": created}
+
+    try:
+        kwargs = dict(
+            params={"format": "json"},
+            headers=headers,
+            files={"document": (name, open(full, "rb"), mime)},
+            data=payload,
+            timeout=180,
+        )
+        if PAPERLESS_USER and PAPERLESS_PASS:
+            kwargs["auth"] = (PAPERLESS_USER, PAPERLESS_PASS)
+        resp = requests.post(PAPERLESS_URL + "/api/documents/post_document/", **kwargs)
+    except requests.RequestException as e:
+        return False, "Verbindung zu Paperless fehlgeschlagen: %s" % e, None
+
+    if resp.status_code in (200, 201):
+        doc_id = None
+        try:
+            data = resp.json()
+            if isinstance(data, str):
+                doc_id = data
+            elif isinstance(data, dict):
+                doc_id = data.get("id")
+        except ValueError:
+            pass
+        log("paperless upload ok: %s %s" % (name, resp.status_code))
+        mark_paperless(name, doc_id)
+        return True, "ok", doc_id
+
+    log("paperless upload failed: %s %s" % (name, resp.status_code))
+    return False, "Paperless antwortete mit Status %s: %s" % (resp.status_code, resp.text[:300]), None
+
+
 def preview_worker():
     """Hintergrund: Vorschauen fuer neue/geaenderte Dateien vorrendern."""
     scan_history_sync()
@@ -507,8 +616,15 @@ def auto_scan_once():
         return False
     auto_cfg["state"] = "idle"
     if ok:
-        auto_cfg["last"] = {"file": os.path.basename(dest), "pages": n_pages, "ts": time.time()}
-        log("autoscan: %s (%d Seiten)" % (os.path.basename(dest), n_pages))
+        fn = os.path.basename(dest)
+        auto_cfg["last"] = {"file": fn, "pages": n_pages, "ts": time.time()}
+        log("autoscan: %s (%d Seiten)" % (fn, n_pages))
+        if auto_cfg["paperless"] and PAPERLESS_URL:
+            pok, perr, pid = paperless_upload(fn)
+            if pok:
+                log("autoscan -> paperless %s (doc %s)" % (fn, pid))
+            else:
+                log("autoscan -> paperless fehlgeschlagen: %s" % perr)
         return True
     return False
 
@@ -535,7 +651,10 @@ def auth_check():
     if AUTH_USER and AUTH_PASS:
         a = request.authorization
         if not a or a.username != AUTH_USER or a.password != AUTH_PASS:
-            return jsonify({"error": "unauthorized"}), 401
+            resp = jsonify({"error": "unauthorized"})
+            resp.status_code = 401
+            resp.headers["WWW-Authenticate"] = 'Basic realm="scanner"'
+            return resp
 
 
 @app.route("/")
@@ -574,6 +693,7 @@ def api_autoscan():
     import copy
 
     return jsonify({"enabled": auto_cfg["enabled"], "interval": auto_cfg["interval"],
+                    "paperless": auto_cfg["paperless"],
                     "state": auto_cfg["state"], "last": copy.deepcopy(auto_cfg["last"])})
 
 
@@ -589,6 +709,8 @@ def api_autoscan_set():
                 auto_cfg["interval"] = v
         except (TypeError, ValueError):
             pass
+    if "paperless" in data:
+        auto_cfg["paperless"] = bool(data["paperless"])
     return api_autoscan()
 
 
@@ -601,19 +723,20 @@ def api_scan():
     if not device:
         return jsonify({"error": "Kein Scanner gefunden."}), 400
 
-    mode = str(data.get("mode") or "Color")
+    mode = str(data.get("mode") or "Gray")
     resolution = int(data.get("resolution") or 300)
     source = str(data.get("source") or "")
     fmt = str(data.get("format") or "pdf").lower()
     width_mm = float(data.get("width") or 210)
     height_mm = float(data.get("height") or 297)
     session = str(data.get("session") or "")
+    duplex = bool(data.get("duplex"))
     if source != "ADF":
         last_ui_settings.update(mode=mode, resolution=resolution, x=width_mm, y=height_mm)
 
     if source == "ADF":
-        last_ui_settings.update(mode=mode, resolution=resolution, x=width_mm, y=height_mm)
-        ok, dest, err, n_pages = scan_adf(device, mode, resolution, width_mm, height_mm, fmt)
+        last_ui_settings.update(mode=mode, resolution=resolution, x=width_mm, y=height_mm, duplex=duplex)
+        ok, dest, err, n_pages = scan_adf(device, mode, resolution, width_mm, height_mm, fmt, duplex)
         if not ok:
             return jsonify({"error": err}), 500
         return jsonify({
@@ -699,7 +822,118 @@ def api_cancel():
     if session in jobs:
         job = jobs.pop(session)
         shutil_rmtree(job["dir"])
+    if session in duplex_jobs:
+        job = duplex_jobs.pop(session)
+        shutil_rmtree(job["dir"])
     return jsonify({"success": True})
+
+
+def weave_duplex(front_pages, back_pages):
+    """Vorder- und Rueckseiten zu je einem Blatt zusammenweben.
+
+    Der 2. ADF-Durchzug (nach dem Wenden des Stapels) liefert die Rueckseiten
+    in umgekehrter Reihenfolge, ohne dass der Stapel sortiert werden muss.
+    Reversed + paarweise zusammengelegt -> front[0], back[0], front[1], ..."""
+    backs = list(reversed(back_pages))
+    n = max(len(front_pages), len(backs))
+    order = []
+    for i in range(n):
+        if i < len(front_pages):
+            order.append(front_pages[i])
+        if i < len(backs):
+            order.append(backs[i])
+    return order
+
+
+@app.route("/api/duplex/start", methods=["POST"])
+def api_duplex_start():
+    """Schritt 1: alle Vorderseiten aus dem ADF ziehen. Ergebnis wird als
+    duplex_job vorgemerkt, bis 'back' aufgerufen wird."""
+    cleanup_old_jobs()
+    ensure_services()
+    data = request.get_json(silent=True) or {}
+    device = (data.get("device") or SCANNER_DEVICE or detect_device())
+    if not device:
+        return jsonify({"error": "Kein Scanner gefunden."}), 400
+
+    mode = str(data.get("mode") or "Gray")
+    resolution = int(data.get("resolution") or 300)
+    width_mm = float(data.get("width") or 210)
+    height_mm = float(data.get("height") or 297)
+    if lock_busy():
+        return jsonify({"error": "Ein anderer Scan laeuft gerade."}), 409
+
+    jdir = tempfile.mkdtemp(dir=JOB_DIR)
+    ok, pages, err = adf_scan_pages(device, mode, resolution, width_mm, height_mm, jdir)
+    if not ok:
+        shutil_rmtree(jdir)
+        return jsonify({"error": err}), 500
+
+    jid = os.path.basename(jdir)
+    duplex_jobs[jid] = {
+        "device": device, "mode": mode, "resolution": resolution,
+        "width": width_mm, "height": height_mm,
+        "front_pages": pages, "ts": time.time(),
+    }
+    return jsonify({
+        "success": True,
+        "session": jid,
+        "pages": len(pages),
+        "message": "Vorderseiten gescannt. Stapel umdrehen und erneut einlegen, dann Rueckseiten scannen lassen.",
+    })
+
+
+@app.route("/api/duplex/back", methods=["POST"])
+def api_duplex_back():
+    """Schritt 2: Rueckseiten ziehen, mit Vorderseiten verweben und als PDF
+    zusammenfuegen."""
+    ensure_services()
+    data = request.get_json(silent=True) or {}
+    session = str(data.get("session") or "")
+    job = duplex_jobs.get(session)
+    if not job:
+        return jsonify({"error": "Duplex-Session nicht (mehr) vorhanden."}), 404
+    if lock_busy():
+        return jsonify({"error": "Ein anderer Scan laeuft gerade."}), 409
+
+    jdir2 = tempfile.mkdtemp(dir=JOB_DIR)
+    try:
+        ok, back_pages, err = adf_scan_pages(
+            job["device"], job["mode"], job["resolution"],
+            job["width"], job["height"], jdir2)
+        if not ok:
+            return jsonify({"error": err}), 500
+
+        order = weave_duplex(job["front_pages"], back_pages)
+        n_front = len(job["front_pages"])
+        dest = os.path.join(SCAN_DIR, "scan_%s.pdf" % time.strftime("%Y%m%d_%H%M%S"))
+        try:
+            pptos_merge_pdf(order, dest)
+        except Exception as e:
+            return jsonify({"error": "PDF-Erstellung fehlgeschlagen: %s" % e}), 500
+
+        fn = os.path.basename(dest)
+        automsg = ""
+        if auto_cfg["paperless"] and PAPERLESS_URL:
+            pok, perr, pid = paperless_upload(fn)
+            if pok:
+                automsg = "paperless (doc %s)" % pid
+                log("duplex -> paperless %s (doc %s)" % (fn, pid))
+            else:
+                log("duplex -> paperless fehlgeschlagen: %s" % perr)
+                automsg = "Paperless-Fehler: %s" % perr
+        duplex_jobs.pop(session, None)
+        return jsonify({
+            "success": True,
+            "file": fn,
+            "url": "/scans/%s" % fn,
+            "adf": True,
+            "pages": n_front,
+            "duplex": True,
+            "paperless": automsg,
+        })
+    finally:
+        shutil_rmtree(jdir2)
 
 
 @app.route("/api/preview")
@@ -726,61 +960,12 @@ def api_paperless_send():
     title = str(data.get("title") or "").strip()
     created = str(data.get("created") or "").strip()
 
-    full = os.path.join(SCAN_DIR, name)
-    if not name or not os.path.isfile(full):
-        return jsonify({"error": "Datei nicht gefunden."}), 404
-
-    mime = "application/pdf" if name.lower().endswith(".pdf") else "image/%s" % (
-        "png" if name.lower().endswith(".png") else "jpeg"
-    )
-    headers = {}
-    if PAPERLESS_TOKEN:
-        headers["Authorization"] = "Token %s" % PAPERLESS_TOKEN
-
-    payload = {"title": title or name}
-    if not created:
-        created = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    payload["created"] = created
-
-    try:
-        if PAPERLESS_USER and PAPERLESS_PASS:
-            resp = requests.post(
-                PAPERLESS_URL + "/api/documents/post_document/",
-                params={"format": "json"},
-                auth=(PAPERLESS_USER, PAPERLESS_PASS),
-                headers=headers,
-                files={"document": (name, open(full, "rb"), mime)},
-                data=payload,
-                timeout=180,
-            )
-        else:
-            resp = requests.post(
-                PAPERLESS_URL + "/api/documents/post_document/",
-                params={"format": "json"},
-                headers=headers,
-                files={"document": (name, open(full, "rb"), mime)},
-                data=payload,
-                timeout=180,
-            )
-    except requests.RequestException as e:
-        return jsonify({"error": "Verbindung zu Paperless fehlgeschlagen: %s" % e}), 502
-
-    if resp.status_code in (200, 201):
-        try:
-            data = resp.json()
-            if isinstance(data, str):
-                doc_id = data
-            elif isinstance(data, dict):
-                doc_id = data.get("id")
-            else:
-                doc_id = None
-        except ValueError:
-            doc_id = None
-        log("paperless upload ok: %s %s" % (name, resp.status_code))
-        mark_paperless(name, doc_id)
+    ok, err, doc_id = paperless_upload(name, title, created)
+    if ok:
         return jsonify({"success": True, "id": doc_id, "file": name})
-    log("paperless upload failed: %s %s" % (name, resp.status_code))
-    return jsonify({"error": "Paperless antwortete mit Status %s: %s" % (resp.status_code, resp.text[:300])}), resp.status_code
+    if err == "Datei nicht gefunden.":
+        return jsonify({"error": err}), 404
+    return jsonify({"error": err}), 502
 
 
 @app.route("/scans/<path:name>")
@@ -820,6 +1005,34 @@ def scan_history():
             files.append({"name": f, "size": os.path.getsize(p), "mtime": os.path.getmtime(p),
                           "pages": None, "thumb": False, "paperless_id": None, "paperless_ts": None})
         return jsonify({"files": files})
+
+@app.route("/api/delete", methods=["POST"])
+def api_delete():
+    data = request.get_json(silent=True) or {}
+    name = os.path.basename(str(data.get("file") or ""))
+    if not name or name.startswith("."):
+        return jsonify({"error": "Ungueltiger Dateiname."}), 400
+    full = os.path.join(SCAN_DIR, name)
+    if not os.path.isfile(full):
+        return jsonify({"error": "Datei nicht gefunden."}), 404
+    try:
+        os.remove(full)
+        key_prefix = name.replace(".", "_")
+        for t in os.listdir(THUMB_DIR):
+            if key_prefix + "_" in t:
+                try:
+                    os.remove(os.path.join(THUMB_DIR, t))
+                except OSError:
+                    pass
+        c = db()
+        c.execute("DELETE FROM files WHERE name=?", (name,))
+        c.commit()
+        c.close()
+        log("deleted scan: %s" % name)
+        return jsonify({"success": True, "file": name})
+    except OSError as e:
+        return jsonify({"error": "Loeschen fehlgeschlagen: %s" % e}), 500
+
 
 @app.route("/gallery")
 def gallery():

@@ -17,9 +17,10 @@ a{color:#3ea6ff;text-decoration:none}
 .card .name{font-size:13px;margin:8px 0 4px;word-break:break-all}
 .card .meta{font-size:12px;color:#8b98a8}
 .card.pdf{display:flex;align-items:center;justify-content:center;height:160px;font-size:14px;color:#8b98a8;background:#1d2632;border-radius:6px}
-.plbtn{margin-top:auto;align-self:flex-start;background:#1d2632;border:1px solid #2a3646;color:#dfe7ef;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;text-align:left}
+.plbtn,.dltbtn{margin-top:auto;background:#1d2632;border:1px solid #2a3646;color:#dfe7ef;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;text-align:left}
 .plbtn:hover{border-color:#3ea6ff}
-.plbtn[disabled]{opacity:.5;cursor:not-allowed}
+.dltbtn:hover{border-color:#ff5c5c}
+.plbtn[disabled],.dltbtn[disabled]{opacity:.5;cursor:not-allowed}
 .plmsg{font-size:12px;margin-top:6px;min-height:0}
 </style>
 </head>
@@ -52,12 +53,31 @@ function render(files){
       '<div class="name"><a href="/scans/'+f.name+'" target="_blank">'+f.name+'</a></div>'+
       '<div class="meta">'+Math.round(f.size/1024)+' kB · '+new Date(f.mtime*1000).toLocaleString()+pages+'</div>'+
       plb+
+      '<div style="flex:1"></div>'+
+      '<button class="dltbtn" data-i="'+i+'">🗑 Löschen</button>'+
       '</div>';
   }).join('');
   if(plOk){
     document.querySelectorAll('.plbtn').forEach(b=>{
       b.addEventListener('click', ()=>toPaperless(files[+b.dataset.i].name, b));
     });
+  }
+  document.querySelectorAll('.dltbtn').forEach(b=>{
+    b.addEventListener('click', ()=>deleteFile(files[+b.dataset.i].name, b));
+  });
+}
+
+async function deleteFile(name, btn){
+  if(!confirm('Scan "'+name+'" wirklich löschen?')) return;
+  btn.disabled = true; btn.textContent = 'Lösche…';
+  try{
+    const r = await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:name})}).then(r=>r.json());
+    if(r.error){ alert('Fehler: '+r.error); }
+    else { cardFiles = cardFiles.filter(f=>f.name!==name); render(cardFiles); }
+  }catch(e){
+    alert('Fehler: '+e.message);
+  }finally{
+    btn.disabled = false; btn.textContent = '🗑 Löschen';
   }
 }
 
