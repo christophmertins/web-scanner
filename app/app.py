@@ -599,11 +599,26 @@ def lock_busy():
     return True
 
 
+def wait_scan_free(timeout=25):
+    """Wartet, bis die Scansperre frei ist (z. B. Autoscan laeuft gerade).
+    Returns True wenn frei, False bei Timeout."""
+    t0 = time.time()
+    while lock_busy():
+        if time.time() - t0 > timeout:
+            return False
+        time.sleep(0.5)
+    return True
+
+
 def auto_scan_once():
     """Ein ADF-Versuch aus dem Autoscan-Loop. Wenn Papier da ist, wir der ganze
     Stapel als PDF gescannt; sonst passiert nichts."""
     device = pick_device()
     if not device or lock_busy():
+        return False
+    if duplex_jobs:
+        # Pseudo-Duplex laeuft (zwischen Vorder- und Rueckseiten): nicht
+        # eingreifen, sonst wird der gewendete Stapel weggescannt.
         return False
     s = last_ui_settings
     auto_cfg["state"] = "scanning"
@@ -730,13 +745,12 @@ def api_scan():
     width_mm = float(data.get("width") or 210)
     height_mm = float(data.get("height") or 297)
     session = str(data.get("session") or "")
-    duplex = bool(data.get("duplex"))
     if source != "ADF":
         last_ui_settings.update(mode=mode, resolution=resolution, x=width_mm, y=height_mm)
 
     if source == "ADF":
-        last_ui_settings.update(mode=mode, resolution=resolution, x=width_mm, y=height_mm, duplex=duplex)
-        ok, dest, err, n_pages = scan_adf(device, mode, resolution, width_mm, height_mm, fmt, duplex)
+        last_ui_settings.update(mode=mode, resolution=resolution, x=width_mm, y=height_mm)
+        ok, dest, err, n_pages = scan_adf(device, mode, resolution, width_mm, height_mm, fmt)
         if not ok:
             return jsonify({"error": err}), 500
         return jsonify({
@@ -860,8 +874,8 @@ def api_duplex_start():
     resolution = int(data.get("resolution") or 300)
     width_mm = float(data.get("width") or 210)
     height_mm = float(data.get("height") or 297)
-    if lock_busy():
-        return jsonify({"error": "Ein anderer Scan laeuft gerade."}), 409
+    if not wait_scan_free():
+        return jsonify({"error": "Scanner ist noch beschaeftigt, bitte erneut versuchen."}), 409
 
     jdir = tempfile.mkdtemp(dir=JOB_DIR)
     ok, pages, err = adf_scan_pages(device, mode, resolution, width_mm, height_mm, jdir)
@@ -893,8 +907,8 @@ def api_duplex_back():
     job = duplex_jobs.get(session)
     if not job:
         return jsonify({"error": "Duplex-Session nicht (mehr) vorhanden."}), 404
-    if lock_busy():
-        return jsonify({"error": "Ein anderer Scan laeuft gerade."}), 409
+    if not wait_scan_free():
+        return jsonify({"error": "Scanner ist noch beschaeftigt, bitte erneut versuchen."}), 409
 
     jdir2 = tempfile.mkdtemp(dir=JOB_DIR)
     try:
