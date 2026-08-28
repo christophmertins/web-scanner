@@ -57,3 +57,16 @@ Datum der Device-URI enthält ein `&` -> in YAML als `&amp;` escapen.
 - `network_mode: host` (nötig für Scanner-Discovery im Container)
 - D-Bus Systembus + Avahi werden im Entrypoint gestartet (hpaio braucht beide)
 - Flask (`app/app.py`), mehrseitige PDFs werden mit Pillow zusammengefügt
+
+## CI / Docker-Image
+
+GitHub Actions (`.github/workflows/docker-build.yml`) baut das Image bei jedem
+Push/PR als Multi-Arch-Build (`linux/amd64`, `linux/arm64`). Auf `main` und bei
+Tags wird es unter `ghcr.io/<repo>:latest` (bzw. `:sha-…`, `:v…`) gepusht;
+PRs bauen nur. Fetch des Image auf dem Pi:
+
+```bash
+docker pull ghcr.io/christophmertins/web-scanner:latest
+```
+
+Lokaler Build bleibt `docker compose up -d --build`.
