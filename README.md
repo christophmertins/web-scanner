@@ -1,9 +1,8 @@
 # hp-scanner-web
 
 Docker-basierte Webanwendung zum Scannen mit einem HP Officejet 4500
-(G510) über das Netzwerk. Container läuft auf dem Raspberry Pi
-(`root@10.0.0.225`), spricht den Scanner per SANE/HPLIP an
-(`hpaio://192.168.1.107`).
+(G510) über das Netzwerk. Container läuft auf einem Raspberry Pi, spricht
+den Scanner per SANE/HPLIP an (`hpaio://`).
 
 ## Funktionen
 
@@ -19,12 +18,12 @@ Docker-basierte Webanwendung zum Scannen mit einem HP Officejet 4500
 ## Deployment
 
 ```bash
-scp -r Dockerfile docker-compose.yml entrypoint.sh app .env.example root@10.0.0.225:/opt/scanner-web/
-ssh root@10.0.0.225 "cd /opt/scanner-web && cp .env.example .env && vi .env"
-ssh root@10.0.0.225 "cd /opt/scanner-web && docker compose up -d --build"
+scp -r Dockerfile docker-compose.yml entrypoint.sh app .env.example root@<pi-ip>:/opt/scanner-web/
+ssh root@<pi-ip> "cd /opt/scanner-web && cp .env.example .env && vi .env"
+ssh root@<pi-ip> "cd /opt/scanner-web && docker compose up -d --build"
 ```
 
-Weboberfläche: `http://10.0.0.225:8000` (im LAN)
+Weboberfläche: `http://<pi-ip>:8000` (im LAN)
 
 Scans landen in `/opt/scanner-web/scans/` (Volume `./scans`).
 
@@ -36,7 +35,7 @@ versioniert wird. Gerätespezifische Werte stehen in `docker-compose.yml`.
 
 | Variable | Bedeutung |
 |----------|-----------|
-| `SCANNER_IP` | IP des Scanners (Default `192.168.1.107`) |
+| `SCANNER_IP` | IP des Scanners |
 | `SCANNER_DEVICE` | Explizite hpaio-Device-URI; leer lassen für Auto-Erkennung |
 | `AUTH_USER` / `AUTH_PASS` | Optional Basic Auth für die Webanwendung |
 | `SCAN_TIMEOUT` | Timeout je Scan in Sekunden (Default 120) |
