@@ -57,6 +57,10 @@ Datum der Device-URI enthält ein `&` -> in YAML als `&amp;` escapen.
 - D-Bus Systembus + Avahi werden im Entrypoint gestartet (hpaio braucht beide)
 - Flask (`app/app.py`), mehrseitige PDFs werden mit Pillow zusammengefügt
 
+## Lizenz
+
+GPLv2 (nur Version 2, siehe `LICENSE`).
+
 ## CI / Docker-Image
 
 GitHub Actions (`.github/workflows/docker-build.yml`) baut das Image bei jedem
