@@ -1,11 +1,11 @@
 services:
   scanner:
     build: .
-    container_name: hp-scanner-web
+    container_name: scanner-web
     restart: unless-stopped
     network_mode: host
     environment:
-      # IP/Modell des HP Officejet 4500 (optional, wird sonst auto-erkannt)
+      # IP/Modell des Netwerk-Scanners (optional, wird sonst auto-erkannt)
       - SCANNER_IP=${SCANNER_IP:-}
       - SCANNER_DEVICE=${SCANNER_DEVICE:-}
       # optional: Zugangsschutz fuer die Webanwendung (.env)

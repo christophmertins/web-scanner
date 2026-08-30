@@ -185,7 +185,7 @@ def list_devices(force=False):
         if m:
             devs.append({"id": m.group(1), "desc": m.group(2)})
     if not devs and detect_device():
-        devs = [{"id": detect_device(), "desc": "HP Officejet 4500 All-in-One"}]
+        devs = [{"id": detect_device(), "desc": "Netzwerk-Scanner"}],
     DEVICE_CACHE.update({"ts": now, "list": devs})
     return devs
 

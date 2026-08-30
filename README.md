@@ -1,8 +1,8 @@
-# hp-scanner-web
+# scanner-web
 
-Docker-basierte Webanwendung zum Scannen mit einem HP Officejet 4500
-(G510) über das Netzwerk. Container läuft auf einem Raspberry Pi, spricht
-den Scanner per SANE/HPLIP an (`hpaio://`).
+Docker-basierte Webanwendung zum Scannen über das Netzwerk. Container
+läuft auf einem Raspberry Pi, spricht den Scanner per SANE/HPLIP an
+(`hpaio://`).
 
 ## Funktionen
 
