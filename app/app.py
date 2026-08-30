@@ -950,6 +950,73 @@ def api_duplex_back():
         shutil_rmtree(jdir2)
 
 
+def rgb_to_png(path):
+    """Wandelt ein Bild nach RGB-PNG (fuer PDF-Zusammenbau / Vorschau)."""
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        png = tempfile.mktemp(suffix=".png", dir=JOB_DIR)
+        im.save(png, "PNG")
+        return png
+
+
+@app.route("/api/preview_scan", methods=["POST"])
+def api_preview_scan():
+    """Schnell-Vorschau vor dem Scan: Low-Res-Flatbed-Scan, wird als Bild
+    zurueckgegeben. Kein Live-Stream, aber schneller Blick auf den Inhalt."""
+    if lock_busy():
+        return jsonify({"error": "Scanner ist gerade beschaeftigt, bitte kurz warten."}), 409
+    ensure_services()
+    data = request.get_json(silent=True) or {}
+    device = (data.get("device") or SCANNER_DEVICE or detect_device())
+    if not device:
+        return jsonify({"error": "Kein Scanner gefunden."}), 400
+
+    width_mm = float(data.get("width") or 210)
+    height_mm = float(data.get("height") or 297)
+
+    # Vorschau nur als PNG; Low-Res (72 dpi) fuer Schnelligkeit.
+    png = tempfile.mktemp(suffix=".png", dir=JOB_DIR)
+    cmd = ["scanimage", "-d", device, "--resolution", "72",
+           "--mode", "Color",
+           "--compression", "None",
+           "-x", "%.2f" % width_mm, "-y", "%.2f" % height_mm,
+           "--format", "png", "-o", png]
+    log("preview running: %s" % " ".join(cmd))
+    with scan_lock:
+        rc, so, err = run(cmd, timeout=SCAN_TIMEOUT)
+    if rc != 0:
+        if os.path.exists(png):
+            os.remove(png)
+        return jsonify({"error": err.strip() or "Vorschau-Scan fehlgeschlagen (rc=%s)" % rc}), 500
+    if not os.path.exists(png) or os.path.getsize(png) == 0:
+        return jsonify({"error": "Vorschau-Scan lieferte kein Bild."}), 500
+
+    try:
+        thumb = ensure_preview(png)
+    except Exception as e:
+        thumb = None
+    if not thumb:
+        try:
+            thumb = rgb_to_png(png)
+        except Exception:
+            thumb = png
+    return jsonify({
+        "success": True,
+        "thumb": "/api/preview_img?file=%s" % os.path.basename(thumb),
+    })
+
+
+@app.route("/api/preview_img")
+def api_preview_img():
+    """Liefert ein temporaeres Vorschaubild (auch aus JOB_DIR)."""
+    name = os.path.basename(request.args.get("file", ""))
+    for base in (JOB_DIR, THUMB_DIR):
+        full = os.path.join(base, name)
+        if os.path.isfile(full):
+            return send_from_directory(base, name)
+    abort(404)
+
+
 @app.route("/api/preview")
 def api_preview():
     session = request.args.get("session", "")

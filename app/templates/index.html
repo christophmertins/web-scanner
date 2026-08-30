@@ -69,9 +69,17 @@ a.download{color:var(--acc);text-decoration:none;font-weight:600}
         <option value="a4" selected>A4 (210 × 297 mm)</option>
         <option value="max">Maximal</option>
       </select>
-      <button class="btn btn-primary btn-gap" id="scanbtn" onclick="startScan()">
-        <span id="scanlbl">Scan starten</span>
-      </button>
+      <div style="display:flex;gap:10px;margin-top:16px">
+        <button class="btn btn-primary" id="scanbtn" onclick="startScan()">
+          <span id="scanlbl">Scan starten</span>
+        </button>
+        <button class="btn btn-ghost" id="prevbtn" onclick="previewScan()">
+          Vorschau
+        </button>
+      </div>
+      <div id="previewbox" style="display:none;margin-top:14px">
+        <img id="previmg" alt="Vorschau" style="max-width:100%;max-height:400px;border-radius:8px;border:1px solid var(--border)">
+      </div>
       <button class="btn btn-gap" id="duplexbtn" onclick="startDuplex()" style="display:none">
         Duplex (2× ADF) – Vorder- &amp; Rückseite
       </button>
@@ -174,6 +182,7 @@ function onSourceChange(){
   const isAdf = document.getElementById('source').value === 'ADF';
   hint.style.display = isAdf ? 'block' : 'none';
   document.getElementById('duplexbtn').style.display = isAdf ? 'inline-block' : 'none';
+  document.getElementById('prevbtn').disabled = isAdf;
   if(!isAdf) duplexCancel();
   if(isAdf){
     document.getElementById('format').value = 'pdf';
@@ -188,6 +197,20 @@ async function areaSize(){
     return {w: cfg.options.max_x, h: cfg.options.max_y};
   }
   return {w: 210, h: 297};
+}
+
+async function previewScan(){
+  if(cfg.session) return;
+  const btn = document.getElementById('prevbtn');
+  btn.disabled = true; btn.textContent = 'Vorschau…';
+  setStatus('info', 'Erstelle Vorschau… bitte warten.');
+  const r = await j('/api/preview_scan', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({device: cfg.device, ...await areaSize()})});
+  btn.disabled = false; btn.textContent = 'Vorschau';
+  if(r.error){ setStatus('err', 'Vorschau: ' + r.error); return; }
+  document.getElementById('previmg').src = r.thumb;
+  document.getElementById('previewbox').style.display = 'block';
+  setStatus('info', 'Vorschau geladen. Bei Bedarf ausrichten und dann „Scan starten“.');
 }
 
 async function startScan(){
