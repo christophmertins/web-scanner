@@ -48,20 +48,29 @@ function render(files){
       ? '<div class="plmsg" style="color:#37d67a;">✓ Paperless ('+String(f.paperless_id).slice(0,8)+')</div>'+
         '<button class="plbtn" data-i="'+i+'">→ Erneut senden</button><div class="plmsg"></div>'
       : '<button class="plbtn" data-i="'+i+'">→ An Paperless senden</button><div class="plmsg"></div>') : '');
+    // Language selector for OCR button - stores preference in localStorage
+    const ocrLang = localStorage.getItem('ocr_lang') || 'deu+eng';
+    const ocrb = '<button class="plbtn" data-i="'+i+'" data-action="ocr" title="OCR mit '+ocrLang+'">' +
+      '🔍 OCR (' + ocrLang.replace('+', ', ') + ')' + '</button><div class="plmsg ocrmsg"></div>';
     return '<div class="card">'+
       media+
       '<div class="name"><a href="/scans/'+f.name+'" target="_blank">'+f.name+'</a></div>'+
       '<div class="meta">'+Math.round(f.size/1024)+' kB · '+new Date(f.mtime*1000).toLocaleString()+pages+'</div>'+
       plb+
+      ocrb+
       '<div style="flex:1"></div>'+
       '<button class="dltbtn" data-i="'+i+'">🗑 Löschen</button>'+
       '</div>';
   }).join('');
   if(plOk){
     document.querySelectorAll('.plbtn').forEach(b=>{
+      if(b.dataset.action==='ocr') return;
       b.addEventListener('click', ()=>toPaperless(files[+b.dataset.i].name, b));
     });
   }
+  document.querySelectorAll('.plbtn[data-action="ocr"]').forEach(b=>{
+    b.addEventListener('click', ()=>runOcrGallery(files[+b.dataset.i].name, b));
+  });
   document.querySelectorAll('.dltbtn').forEach(b=>{
     b.addEventListener('click', ()=>deleteFile(files[+b.dataset.i].name, b));
   });
@@ -97,6 +106,25 @@ async function toPaperless(name, btn){
     msg.textContent = 'Fehler: '+e.message; msg.style.color = '#ff5c5c';
   }finally{
     btn.disabled = false; btn.textContent = '→ An Paperless senden';
+  }
+}
+
+async function runOcrGallery(name, btn){
+  const msg = btn.nextElementSibling;
+  btn.disabled = true; btn.textContent = 'OCR…'; msg.textContent = ''; msg.style.color = '';
+  // Use stored preference or default to German+English
+  const storedLang = localStorage.getItem('ocr_lang') || 'deu+eng';
+  const r = await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:name, lang:storedLang})}).then(r=>r.json());
+    if(r.error){ msg.textContent = 'Fehler: '+r.error; msg.style.color = '#ff5c5c'; }
+    else {
+      msg.innerHTML = '<b>'+r.chars+' Zeichen</b> (Konfidenz '+r.confidence+'%)<br>'+
+        '<textarea readonly style="width:100%;height:80px;margin-top:4px;background:#0f141b;border:1px solid #2a3646;color:#dfe7ef;border-radius:4px;padding:6px;font-size:12px;font-family:monospace;resize:vertical">'+r.text+'</textarea>';
+      msg.style.color = '#dfe7ef';
+    }
+  }catch(e){
+    msg.textContent = 'Fehler: '+e.message; msg.style.color = '#ff5c5c';
+  }finally{
+    btn.disabled = false; btn.textContent = '🔍 OCR';
   }
 }
 
