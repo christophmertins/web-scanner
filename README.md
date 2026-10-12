@@ -12,7 +12,10 @@ läuft auf einem Raspberry Pi, spricht den Scanner per SANE/HPLIP an
 - Wählbar: Modus (Farbe/Graustufen/Lineart), Auflösung (100–600 dpi),
   Scanbereich (A4 oder Gerät-maximal)
 - Vorschau, Download, Galerie der bisherigen Scans
+- **OCR-Texterkennung** (tesseract, deu+eng) direkt nach dem Scan und aus der Galerie
 - „An Paperless senden“ direkt nach dem Scan **und nachträglich aus Galerie/Verlauf**
+- **API-Dokumentation** unter `/api/docs` (Swagger UI, OpenAPI 3)
+- Docker **Healthcheck** (`/api/health`)
 - Optionaler Basic-Auth-Schutz
 
 ## Deployment
@@ -24,6 +27,9 @@ ssh root@<pi-ip> "cd /opt/scanner-web && docker compose up -d --build"
 ```
 
 Weboberfläche: `http://<pi-ip>:8000` (im LAN)
+
+API-Dokumentation: `http://<pi-ip>:8000/api/docs`
+OCR: `POST /api/ocr` mit `{"file": "<name>", "lang": "deu+eng"}` → JSON mit `text`, `confidence`, `chars`
 
 Scans landen in `/opt/scanner-web/scans/` (Volume `./scans`).
 
@@ -56,6 +62,7 @@ Datum der Device-URI enthält ein `&` -> in YAML als `&amp;` escapen.
 - `network_mode: host` (nötig für Scanner-Discovery im Container)
 - D-Bus Systembus + Avahi werden im Entrypoint gestartet (hpaio braucht beide)
 - Flask (`app/app.py`), mehrseitige PDFs werden mit Pillow zusammengefügt
+- OCR mit Tesseract (`tesseract-ocr`, Sprachen `deu` + `eng`)
 
 ## Lizenz
 

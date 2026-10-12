@@ -119,11 +119,31 @@ a.download{color:var(--acc);text-decoration:none;font-weight:600}
       <div class="toolbar" style="align-items:center">
         <a href="#" id="dl" class="download">Download</a>
         <button class="btn btn-ghost" onclick="sendToPaperless()" id="plbtn" style="display:none">An Paperless senden</button>
+        <button class="btn btn-ghost" onclick="runOcr()" id="ocrbtn">OCR (Texterkennung)</button>
       </div>
       <img id="preview" alt="Scan-Vorschau">
+      <div id="ocrbox" style="display:none;margin-top:14px">
+        <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          Sprache:
+          <select id="ocrlang" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;font-size:13px">
+            <option value="deu+eng" selected>Deutsch + Englisch</option>
+            <option value="deu">Nur Deutsch</option>
+            <option value="eng">Nur Englisch</option>
+            <option value="fra">Französisch</option>
+            <option value="ita">Italienisch</option>
+            <option value="spa">Spanisch</option>
+          </select>
+        </label>
+        <div style="display:flex;gap:10px;margin-bottom:8px">
+          <button class="btn btn-ghost" id="ocrbtn2" onclick="runOcr()">Texterkennung starten</button>
+          <button class="btn btn-ghost" onclick="copyOcrText()" id="ocrbtn3" style="display:none">Kopieren</button>
+        </div>
+        <div id="ocrresult" style="display:none;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:13px;white-space:pre-wrap;max-height:400px;overflow-y:auto"></div>
+        <div id="ocrmeta" style="font-size:12px;color:var(--muted);margin-top:4px"></div>
+      </div>
     </div>
     <div class="panel">
-      <h2>Zuletzt gescannt <a href="/gallery" style="float:right;font-size:12px;color:var(--acc)">Galerie →</a></h2>
+      <h2>Zuletzt gescannt <a href="/gallery" style="float:right;font-size:12px;color:var(--acc)">Galerie →</a> <a href="/api/docs" target="_blank" style="float:right;font-size:12px;color:var(--acc);margin-right:8px">API →</a></h2>
       <div id="automsg" style="display:none"></div>
       <div id="history" style="font-size:13px;color:var(--muted)">Wird geladen…</div>
     </div>
@@ -144,7 +164,45 @@ function setStatus(cls, txt){
   s.textContent = txt;
 }
 
-async function init(){
+async async function runOcr(){
+  if(!lastFile){ setStatus('err', 'Keine Datei vorhanden.'); return; }
+  const btn = document.getElementById('ocrbtn2');
+  const lang = document.getElementById('ocrlang').value;
+  btn.disabled = true; btn.textContent = 'Erkennung läuft…';
+  setStatus('info', 'OCR: Texterkennung wird durchgeführt…');
+  document.getElementById('ocrresult').style.display='none';
+  document.getElementById('ocrmeta').textContent='';
+  document.getElementById('ocrbtn3').style.display='none';
+  try{
+    const r = await j('/api/ocr', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({file: lastFile, lang: lang})});
+    if(r.error){ setStatus('err', 'OCR: ' + r.error); return; }
+    const box = document.getElementById('ocrresult');
+    box.textContent = r.text || '(kein Text erkannt)';
+    box.style.display = 'block';
+    document.getElementById('ocrmeta').textContent =
+      r.pages + ' Seite' + (r.pages===1?'':'n') + ' · ' +
+      r.chars + ' Zeichen · ' +
+      'Konfidenz: ' + r.confidence + '%';
+    document.getElementById('ocrbtn3').style.display = r.text ? 'inline-block' : 'none';
+    document.getElementById('ocrbox').style.display = 'block';
+    setStatus('ok', 'OCR: ' + r.chars + ' Zeichen erkannt (Konfidenz ' + r.confidence + '%).');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Texterkennung starten';
+  }
+}
+
+async function copyOcrText(){
+  const txt = document.getElementById('ocrresult').textContent;
+  try{
+    await navigator.clipboard.writeText(txt);
+    setStatus('ok', 'Text in die Zwischenablage kopiert.');
+  }catch(e){
+    setStatus('err', 'Kopieren fehlgeschlagen: ' + e.message);
+  }
+}
+
+function init(){
   const c = await j('/api/config');
   if(c.error){ document.getElementById('waitpanel').style.display='none';
     document.getElementById('scanpanel').style.display='block';
@@ -218,6 +276,7 @@ async function startScan(){
   lastFile = null;
   document.getElementById('plbtn').style.display='none';
   document.getElementById('singlepanel').style.display='none';
+  document.getElementById('ocrbox').style.display='none';
   const s = document.getElementById('source').value;
   const body = {
     device: cfg.device,
@@ -241,6 +300,7 @@ async function startScan(){
     document.getElementById('dl').textContent = 'Download ' + r.file;
     document.getElementById('preview').style.display = 'none';
     document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+    document.getElementById('ocrbox').style.display = 'block';
     setStatus('ok', 'ADF-Scan mit ' + (r.pages||0) + ' Seiten fertig.');
     loadHistory();
     return;
@@ -262,6 +322,7 @@ async function startScan(){
     document.getElementById('preview').style.display = 'block';
     document.getElementById('preview').src = r.thumb;
     document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+    document.getElementById('ocrbox').style.display = 'block';
     setStatus('ok', 'Scan fertig.');
     loadHistory();
   }
@@ -311,6 +372,7 @@ async function duplexBack(){
   document.getElementById('dl').textContent = 'Download ' + r.file;
   document.getElementById('preview').style.display = 'none';
   document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+  document.getElementById('ocrbox').style.display = 'block';
   setStatus('ok', 'Duplex-Scan mit ' + (r.pages||0) + ' Blättern ('+(r.duplex?'Vorder-/Rückseite): ' : '): ') +
     'PDF fertig.' + (r.paperless ? ' ' + r.paperless : ''));
   loadHistory();
@@ -357,6 +419,7 @@ cfg.session = null;
   document.getElementById('dl').href = r.url;
   document.getElementById('dl').textContent = 'Download ' + r.file;
   document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+  document.getElementById('ocrbox').style.display = 'block';
   setStatus('ok', 'PDF mit '+r.pages+' Seiten erstellt.');
   loadHistory();
 }

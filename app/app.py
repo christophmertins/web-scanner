@@ -12,7 +12,7 @@ import zipfile
 from datetime import datetime
 
 import requests
-from flask import Flask, request, jsonify, render_template, send_from_directory, abort
+from flask import Flask, request, jsonify, render_template, send_from_directory, abort, Response
 from PIL import Image
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -670,6 +670,434 @@ def auth_check():
             resp.status_code = 401
             resp.headers["WWW-Authenticate"] = 'Basic realm="scanner"'
             return resp
+
+
+@app.route("/api/health")
+def api_health():
+    health = {"status": "ok", "timestamp": time.time(), "scanner": "unknown", "catalog": "ok"}
+    try:
+        c = db()
+        c.execute("SELECT 1")
+        c.close()
+    except Exception as e:
+        health["catalog"] = "error: %s" % e
+        health["status"] = "degraded"
+    device = pick_device()
+    if device:
+        health["scanner"] = device
+        if lock_busy():
+            health["scanner_busy"] = True
+    else:
+        health["scanner"] = "not found"
+        health["status"] = "degraded"
+    return jsonify(health)
+
+
+@app.route("/api/ocr", methods=["POST"])
+def api_ocr():
+    data = request.get_json(silent=True) or {}
+    name = os.path.basename(str(data.get("file") or ""))
+    lang = str(data.get("lang") or "deu+eng").strip()
+    if not name:
+        return jsonify({"error": "Kein Dateiname angegeben."}), 400
+    full = os.path.join(SCAN_DIR, name)
+    if not os.path.isfile(full):
+        return jsonify({"error": "Datei nicht gefunden: %s" % name}), 404
+    if not lang:
+        lang = "deu+eng"
+    tmp = None
+    try:
+        if name.lower().endswith(".pdf"):
+            tmp = tempfile.mktemp(suffix=".png", dir=JOB_DIR)
+            rc, _, err = run(["pdftoppm", "-jpeg", "-r", "300", "-f", "1", "-l", "1", full, tmp[:-4]], timeout=60)
+            if rc != 0 or not glob.glob(tmp[:-4] + "*.jpg"):
+                return jsonify({"error": "PDF-Konvertierung fehlgeschlagen: %s" % (err.strip() or "unbekannt")}), 500
+            inputs = sorted(glob.glob(tmp[:-4] + "*.jpg"))
+        else:
+            inputs = [full]
+        all_text = []
+        total_conf = 0.0
+        total_chars = 0
+        for img_path in inputs:
+            out_base = tempfile.mktemp(suffix="", dir=JOB_DIR)
+            cmd = ["tesseract", img_path, out_base, "-l", lang, "--oem", "1", "--psm", "3",
+                   "tsv", "txt"]
+            rc, so, err = run(cmd, timeout=120)
+            if rc != 0:
+                return jsonify({"error": "Tesseract fehlgeschlagen: %s" % (err.strip() or "rc=%s" % rc)}), 500
+            txt_path = out_base + ".txt"
+            tsv_path = out_base + ".tsv"
+            text = ""
+            if os.path.exists(txt_path):
+                with open(txt_path) as f:
+                    text = f.read().strip()
+                try:
+                    os.remove(txt_path)
+                except OSError:
+                    pass
+            conf = 0.0
+            chars = 0
+            if os.path.exists(tsv_path):
+                try:
+                    with open(tsv_path) as f:
+                        for line in f:
+                            parts = line.strip().split("\t")
+                            if len(parts) >= 11 and parts[0] == "word":
+                                c = float(parts[10]) if parts[10] != "-1" else 0.0
+                                l = len(parts[11]) if len(parts) > 11 else 0
+                                if l > 0:
+                                    conf += c * l
+                                    chars += l
+                except Exception:
+                    pass
+                try:
+                    os.remove(tsv_path)
+                except OSError:
+                    pass
+            all_text.append(text)
+            total_conf += conf
+            total_chars += chars
+        full_text = "\n\n".join(t for t in all_text if t)
+        avg_conf = (total_conf / total_chars) if total_chars > 0 else 0.0
+        return jsonify({
+            "success": True,
+            "file": name,
+            "lang": lang,
+            "pages": len(inputs),
+            "text": full_text,
+            "confidence": round(avg_conf, 1),
+            "chars": len(full_text),
+        })
+    finally:
+        if tmp:
+            prefix = tmp[:-4]
+            for f in glob.glob(prefix + "*"):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+
+SWAGGER_HTML = """<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Scanner Web – API Dokumentation</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+<style>body{margin:0;background:#0f141b} .topbar{display:none}</style>
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+SwaggerUIBundle({
+  url: "/api/openapi.json",
+  dom_id: "#swagger-ui",
+  theme: "dark",
+  deepLinking: true,
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+  layout: "BaseLayout"
+});
+</script>
+</body>
+</html>"""
+
+
+@app.route("/api/docs")
+def api_docs():
+    return Response(SWAGGER_HTML, content_type="text/html; charset=utf-8")
+
+
+@app.route("/api/openapi.json")
+def api_openapi():
+    spec = {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Scanner Web API",
+            "version": "1.0.0",
+            "description": "Web-API fuer den Netzwerk-Scanner (SANE/HPLIP). "
+                           "Scans als PDF/JPEG/PNG, ADF, Duplex, Paperless-Upload, OCR.",
+        },
+        "servers": [{"url": "/"}],
+        "paths": {
+            "/api/health": {
+                "get": {
+                    "summary": "Health-Check",
+                    "operationId": "health",
+                    "tags": ["System"],
+                    "responses": {"200": {"description": "Service ist erreichbar"}},
+                },
+            },
+            "/api/config": {
+                "get": {
+                    "summary": "Scanner-Konfiguration abrufen",
+                    "operationId": "getConfig",
+                    "tags": ["Scanner"],
+                    "responses": {"200": {"description": "Geräteoptionen und Status"}},
+                },
+            },
+            "/api/devices": {
+                "get": {
+                    "summary": "Gefundene SANE-Geräte auflisten",
+                    "operationId": "listDevices",
+                    "tags": ["Scanner"],
+                    "parameters": [
+                        {"name": "refresh", "in": "query", "schema": {"type": "string", "enum": ["0", "1"]},
+                         "description": "Cache ignorieren und Neu-Suche starten"},
+                    ],
+                    "responses": {"200": {"description": "Geräteliste"}},
+                },
+            },
+            "/api/scan": {
+                "post": {
+                    "summary": "Scan starten (Einzelseite oder ADF)",
+                    "operationId": "scan",
+                    "tags": ["Scan"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "device": {"type": "string", "description": "SANE-Device-URI"},
+                                        "mode": {"type": "string", "enum": ["Color", "Gray", "Lineart"], "default": "Gray"},
+                                        "resolution": {"type": "integer", "default": 300},
+                                        "source": {"type": "string", "enum": ["Flatbed", "ADF", "Auto"], "default": "Flatbed"},
+                                        "format": {"type": "string", "enum": ["pdf", "jpeg", "png"], "default": "pdf"},
+                                        "width": {"type": "number", "default": 210},
+                                        "height": {"type": "number", "default": 297},
+                                        "session": {"type": "string", "description": "Session-ID fuer mehrseitigen PDF-Scan"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Scan erfolgreich (Datei oder Session-Fortschritt)"},
+                        "400": {"description": "Kein Scanner gefunden"},
+                        "500": {"description": "Scan fehlgeschlagen"},
+                    },
+                },
+            },
+            "/api/finish": {
+                "post": {
+                    "summary": "Mehrseitigen PDF-Scan abschliessen",
+                    "operationId": "finishPdf",
+                    "tags": ["Scan"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "properties": {"session": {"type": "string"}}}}},
+                    },
+                    "responses": {"200": {"description": "PDF-Datei erstellt"}, "404": {"description": "Session nicht gefunden"}},
+                },
+            },
+            "/api/cancel": {
+                "post": {
+                    "summary": "Scan-Jobs abbrechen",
+                    "operationId": "cancelJob",
+                    "tags": ["Scan"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "properties": {"session": {"type": "string"}}}}},
+                    },
+                    "responses": {"200": {"description": "Abgebrochen"}},
+                },
+            },
+            "/api/duplex/start": {
+                "post": {
+                    "summary": "Duplex-Scan: Vorderseiten aus dem ADF ziehen",
+                    "operationId": "duplexStart",
+                    "tags": ["Scan"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "device": {"type": "string"},
+                                        "mode": {"type": "string"},
+                                        "resolution": {"type": "integer"},
+                                        "width": {"type": "number"},
+                                        "height": {"type": "number"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "responses": {"200": {"description": "Vorderseiten gescannt"}, "409": {"description": "Scanner beschaeftigt"}},
+                },
+            },
+            "/api/duplex/back": {
+                "post": {
+                    "summary": "Duplex-Scan: Rueckseiten scannen und mit Vorderseiten verweben",
+                    "operationId": "duplexBack",
+                    "tags": ["Scan"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "properties": {"session": {"type": "string"}}}}},
+                    },
+                    "responses": {"200": {"description": "Duplex-PDF erstellt"}, "404": {"description": "Session nicht gefunden"}},
+                },
+            },
+            "/api/preview_scan": {
+                "post": {
+                    "summary": "Schnell-Vorschau (Low-Res-Scan)",
+                    "operationId": "previewScan",
+                    "tags": ["Scan"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "device": {"type": "string"},
+                                        "width": {"type": "number"},
+                                        "height": {"type": "number"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "responses": {"200": {"description": "Vorschaubild"}, "409": {"description": "Scanner beschaeftigt"}},
+                },
+            },
+            "/api/preview": {
+                "get": {
+                    "summary": "Vorschaubild einer PDF-Seite",
+                    "operationId": "preview",
+                    "tags": ["Scan"],
+                    "parameters": [
+                        {"name": "session", "in": "query", "required": True, "schema": {"type": "string"}},
+                        {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}},
+                    ],
+                    "responses": {"200": {"description": "JPEG-Vorschaubild"}, "404": {"description": "Nicht gefunden"}},
+                },
+            },
+            "/api/preview_img": {
+                "get": {
+                    "summary": "Temporaeres Vorschaubild abrufen",
+                    "operationId": "previewImg",
+                    "tags": ["Scan"],
+                    "parameters": [
+                        {"name": "file", "in": "query", "required": True, "schema": {"type": "string"}},
+                    ],
+                    "responses": {"200": {"description": "Bild"}, "404": {"description": "Nicht gefunden"}},
+                },
+            },
+            "/api/autoscan": {
+                "get": {
+                    "summary": "Autoscan-Status abrufen",
+                    "operationId": "getAutoscan",
+                    "tags": ["Autoscan"],
+                    "responses": {"200": {"description": "Status und letzter Scan"}},
+                },
+                "post": {
+                    "summary": "Autoscan konfigurieren",
+                    "operationId": "setAutoscan",
+                    "tags": ["Autoscan"],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "enabled": {"type": "boolean"},
+                                        "interval": {"type": "number", "minimum": 1, "maximum": 60},
+                                        "paperless": {"type": "boolean"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "responses": {"200": {"description": "Aktualisierter Status"}},
+                },
+            },
+            "/api/paperless/send": {
+                "post": {
+                    "summary": "Datei an Paperless-ngx senden",
+                    "operationId": "paperlessSend",
+                    "tags": ["Paperless"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["file"],
+                                    "properties": {
+                                        "file": {"type": "string", "description": "Dateiname im /scans-Verzeichnis"},
+                                        "title": {"type": "string", "description": "Titel in Paperless"},
+                                        "created": {"type": "string", "description": "ISO-8601 Datum"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "responses": {"200": {"description": "Erfolgreich gesendet"}, "404": {"description": "Datei nicht gefunden"}, "502": {"description": "Paperless-Fehler"}},
+                },
+            },
+            "/api/ocr": {
+                "post": {
+                    "summary": "OCR-Texterkennung (tesseract)",
+                    "operationId": "ocr",
+                    "tags": ["OCR"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["file"],
+                                    "properties": {
+                                        "file": {"type": "string", "description": "Dateiname im /scans-Verzeichnis"},
+                                        "lang": {"type": "string", "default": "deu+eng",
+                                                  "description": "tesseract-Sprache(n), z.B. deu, eng, deu+eng"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Erkannter Text mit Konfidenz"},
+                        "404": {"description": "Datei nicht gefunden"},
+                        "500": {"description": "OCR fehlgeschlagen"},
+                    },
+                },
+            },
+            "/api/delete": {
+                "post": {
+                    "summary": "Scan loeschen",
+                    "operationId": "deleteScan",
+                    "tags": ["Galerie"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object", "properties": {"file": {"type": "string"}}}}},
+                    },
+                    "responses": {"200": {"description": "Geloescht"}, "404": {"description": "Nicht gefunden"}},
+                },
+            },
+            "/scans/": {
+                "get": {
+                    "summary": "Alle Scans als JSON-Liste",
+                    "operationId": "listScans",
+                    "tags": ["Galerie"],
+                    "responses": {"200": {"description": "Dateiliste mit Metadaten"}},
+                },
+            },
+            "/gallery": {
+                "get": {
+                    "summary": "Galerie-Seite (HTML)",
+                    "operationId": "gallery",
+                    "tags": ["UI"],
+                    "responses": {"200": {"description": "HTML-Seite"}},
+                },
+            },
+        },
+    }
+    return jsonify(spec)
 
 
 @app.route("/")

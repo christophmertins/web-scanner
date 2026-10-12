@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     avahi-daemon \
     libnss-mdns \
     poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-deu \
+    tesseract-ocr-eng \
     python3 \
     python3-flask \
     python3-pil \
@@ -26,5 +29,8 @@ RUN chmod +x /entrypoint.sh
 
 EXPOSE 8000
 VOLUME /scans
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:8000/api/health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
