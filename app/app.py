@@ -70,6 +70,9 @@ DEVICE_CACHE = {"ts": 0, "list": []}
 OPT_CACHE_FILE = os.path.join(SCAN_DIR, ".device_options.json")
 OPT_CACHE_TTL = 3600
 OPT_DISK_TTL = 86400
+# Zeit, die eine Duplex-Session (Vorderseiten gescannt) auf die Rueckseiten wartet.
+# Danach verfaellt sie, damit der Autoscan nicht dauerhaft blockiert bleibt.
+DUPLEX_TTL = int(os.environ.get("DUPLEX_TTL", "900"))
 _opt_cache = {"device": None, "ts": 0.0, "opts": None}
 
 # Autoscans: lauffaehiger Background-Poller, der bei Papier im ADF automatisch scannt
@@ -215,8 +218,22 @@ def parse_device_options(out):
     return opts
 
 
+def _options_usable(opts):
+    """Wurden ueberhaupt Geraeteoptionen erkannt?
+
+    Ist der Scanner belegt (z. B. waehrend eines ADF-Scans), antwortet
+    `scanimage --help` mit rc=0, aber nur mit dem generischen Usage-Text.
+    Solch ein leeres Ergebnis darf nie gecacht werden, sonst fehlen Quellen
+    (ADF) und damit der Duplex-Knopf fuer die ganze Cache-Laufzeit."""
+    if not opts:
+        return False
+    return bool(opts.get("modes") or opts.get("resolutions") or opts.get("sources")
+                or opts.get("max_x") or opts.get("max_y"))
+
+
 def _opt_cache_valid(cache, device, ttl):
-    return cache["device"] == device and cache["opts"] is not None and time.time() - cache["ts"] < ttl
+    return (cache["device"] == device and _options_usable(cache["opts"])
+            and time.time() - cache["ts"] < ttl)
 
 
 def _opt_cache_load_disk(device):
@@ -228,7 +245,8 @@ def _opt_cache_load_disk(device):
     except Exception:
         return
     now = time.time()
-    if data.get("device") == device and data.get("opts") and now - data.get("ts", 0) < OPT_DISK_TTL:
+    if (data.get("device") == device and _options_usable(data.get("opts"))
+            and now - data.get("ts", 0) < OPT_DISK_TTL):
         _opt_cache = {"device": device, "ts": data["ts"], "opts": data["opts"]}
         log("loaded cached device options")
 
@@ -281,6 +299,11 @@ def device_options(device):
         return {}, "scanimage --help failed: %s" % err.strip()
 
     opts = parse_device_options(out)
+    if not _options_usable(opts):
+        # Belegtes Geraet: rc=0, aber nur generischer Usage-Text. Nicht cachen.
+        log("scanimage --help ohne Geraeteoptionen: %s" % err.strip())
+        return {}, "Scanner belegt? Geraeteoptionen nicht lesbar (%s)" % (err.strip() or "keine Angabe")
+
     entry = {"device": device, "ts": time.time(), "opts": opts}
     _opt_cache = entry
     _opt_cache_save_disk(entry)
@@ -441,6 +464,35 @@ def ensure_preview(src, max_w=400):
     return cache
 
 
+def prune_duplex_jobs(max_age=None):
+    """Wartende Duplex-Sessions (Vorderseiten liegen bereit) verfallen lassen.
+
+    Ohne Ablauf blockiert eine vergessene Session den Autoscan dauerhaft:
+    auto_scan_once steigt aus, solange duplex_jobs gefuellt ist."""
+    max_age = DUPLEX_TTL if max_age is None else max_age
+    now = time.time()
+    for jid, j in list(duplex_jobs.items()):
+        if now - j.get("ts", 0) > max_age:
+            # Job-Dicts fuehren kein "dir"; die Seiten liegen unter JOB_DIR/<jid>.
+            shutil_rmtree(j.get("dir") or os.path.join(JOB_DIR, jid))
+            duplex_jobs.pop(jid, None)
+            log("duplex session %s abgelaufen" % jid)
+
+
+def pending_duplex():
+    """Die juengste wartende Duplex-Session (oder None)."""
+    prune_duplex_jobs()
+    if not duplex_jobs:
+        return None
+    jid, job = max(duplex_jobs.items(), key=lambda kv: kv[1].get("ts", 0))
+    return {
+        "session": jid,
+        "pages": len(job.get("front_pages") or []),
+        "age": int(time.time() - job.get("ts", 0)),
+        "ttl": DUPLEX_TTL,
+    }
+
+
 def cleanup_old_jobs(max_age=3600):
     now = time.time()
     for jid, j in list(jobs.items()):
@@ -450,13 +502,7 @@ def cleanup_old_jobs(max_age=3600):
             except Exception:
                 pass
             jobs.pop(jid, None)
-    for jid, j in list(duplex_jobs.items()):
-        if now - j["ts"] > max_age:
-            try:
-                shutil_rmtree(j["dir"])
-            except Exception:
-                pass
-            duplex_jobs.pop(jid, None)
+    prune_duplex_jobs(max_age)
 
 
 def shutil_rmtree(d):
@@ -616,6 +662,7 @@ def auto_scan_once():
     device = pick_device()
     if not device or lock_busy():
         return False
+    prune_duplex_jobs()
     if duplex_jobs:
         # Pseudo-Duplex laeuft (zwischen Vorder- und Rueckseiten): nicht
         # eingreifen, sonst wird der gewendete Stapel weggescannt.
@@ -782,7 +829,7 @@ SWAGGER_HTML = """<!DOCTYPE html>
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<title>Scanner Web – API Dokumentation</title>
+<title>Web-Scanner – API Dokumentation</title>
 <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
 <style>body{margin:0;background:#0f141b} .topbar{display:none}</style>
 </head>
@@ -813,7 +860,7 @@ def api_openapi():
     spec = {
         "openapi": "3.0.3",
         "info": {
-            "title": "Scanner Web API",
+            "title": "Web-Scanner API",
             "version": "1.0.0",
             "description": "Web-API fuer den Netzwerk-Scanner (SANE/HPLIP). "
                            "Scans als PDF/JPEG/PNG, ADF, Duplex, Paperless-Upload, OCR.",
@@ -1116,12 +1163,14 @@ def api_config():
     device = pick_device()
     if not device:
         return jsonify({"device": None, "error": "Kein Scanner gefunden.", "paperless": bool(PAPERLESS_URL)})
-    opts, err = device_options(device)
+    opts, opts_err = device_options(device)
     return jsonify({
         "device": device,
         "options": opts,
+        "options_error": opts_err,
         "paperless": bool(PAPERLESS_URL),
-        "error": err,
+        "error": None,
+        "duplex": pending_duplex(),
         "autoscan": {
             "enabled": auto_cfg["enabled"],
             "interval": auto_cfg["interval"],
@@ -1137,6 +1186,7 @@ def api_autoscan():
 
     return jsonify({"enabled": auto_cfg["enabled"], "interval": auto_cfg["interval"],
                     "paperless": auto_cfg["paperless"],
+                    "paused": "duplex" if pending_duplex() else None,
                     "state": auto_cfg["state"], "last": copy.deepcopy(auto_cfg["last"])})
 
 
@@ -1302,6 +1352,12 @@ def api_duplex_start():
     resolution = int(data.get("resolution") or 300)
     width_mm = float(data.get("width") or 210)
     height_mm = float(data.get("height") or 297)
+    pending = pending_duplex()
+    if pending:
+        return jsonify({
+            "error": "Duplex-Session läuft bereits: erst Rückseiten scannen oder abbrechen.",
+            **pending,
+        }), 409
     if not wait_scan_free():
         return jsonify({"error": "Scanner ist noch beschaeftigt, bitte erneut versuchen."}), 409
 

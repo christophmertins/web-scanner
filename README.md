@@ -1,4 +1,4 @@
-# scanner-web
+# Web-Scanner
 
 Docker-basierte Webanwendung zum Scannen über das Netzwerk. Container
 läuft auf einem Raspberry Pi, spricht den Scanner per SANE/HPLIP an

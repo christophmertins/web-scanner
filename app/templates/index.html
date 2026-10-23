@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Scanner Web</title>
+<title>Web-Scanner</title>
 <style>
 :root{
   --bg:#0f141b; --panel:#171e28; --panel2:#1d2632; --border:#2a3646;
@@ -44,13 +44,13 @@ a.download{color:var(--acc);text-decoration:none;font-weight:600}
 </head>
 <body>
 <div class="wrap">
-<h1><span>📠</span> Scanner Web <small id="devlabel">–</small></h1>
+<h1><span>📠</span> Web-Scanner <small id="devlabel">–</small></h1>
 <div class="layout">
   <div>
     <div class="panel" id="scanpanel" style="display:none">
       <h2>Neuer Scan</h2>
       <label>Gerät</label>
-      <select id="device"></select>
+      <select id="device" onchange="cfg.device = this.value"></select>
       <label>Scan-Quelle</label>
       <select id="source" onchange="onSourceChange()"></select>
       <div class="meta" id="sourceHint" style="display:none">Bei ADF wird komplett durchgezogen und als PDF zusammengefasst.</div>
@@ -95,6 +95,7 @@ a.download{color:var(--acc);text-decoration:none;font-weight:600}
         Auto-Scan (ADF)
         <span class="meta">Startet automatisch beim Einlegen.</span>
       </label>
+      <div class="meta" id="autopause" style="display:none;color:#e0b341">Auto-Scan pausiert: Duplex-Session aktiv – erst Rückseiten scannen oder abbrechen.</div>
       <div class="status" id="status"></div>
     </div>
     <div class="panel" id="waitpanel" style="display:none">
@@ -164,7 +165,7 @@ function setStatus(cls, txt){
   s.textContent = txt;
 }
 
-async async function runOcr(){
+async function runOcr(){
   if(!lastFile){ setStatus('err', 'Keine Datei vorhanden.'); return; }
   const btn = document.getElementById('ocrbtn2');
   const lang = document.getElementById('ocrlang').value;
@@ -202,7 +203,7 @@ async function copyOcrText(){
   }
 }
 
-function init(){
+async function init(){
   const c = await j('/api/config');
   if(c.error){ document.getElementById('waitpanel').style.display='none';
     document.getElementById('scanpanel').style.display='block';
@@ -215,17 +216,29 @@ function init(){
   document.getElementById('scanpanel').style.display='block';
   const o = c.options || {};
   const devsel = document.getElementById('device');
-  if(!o.modes || !o.modes.length){
+  devsel.innerHTML = '';
+  try{
     const d = await j('/api/devices');
-    d.devices.forEach(dd => { devsel.add(new Option(dd.desc, dd.id)); });
-    if(d.devices.length) cfg.device = d.devices[0].id;
-  }
+    (d.devices || []).forEach(dd => devsel.add(new Option(dd.desc, dd.id)));
+  }catch(e){}
+  if(!devsel.options.length && c.device) devsel.add(new Option(c.device, c.device));
+  devsel.value = c.device || '';
   fillSelect('mode', o.modes || ['Color','Gray'], 'Gray');
   fillSelect('resolution', (o.resolutions||[100,200,300]).map(String), '300');
-  const srcs = (o.sources && o.sources.length) ? o.sources : ['Auto','Flatbed'];
+  const srcs = (o.sources && o.sources.length) ? o.sources : ['Auto','Flatbed','ADF'];
+  cfg.sources = srcs;
   fillSelect('source', srcs, srcs.includes('Auto') ? 'Auto' : srcs[0]);
   onSourceChange();
-  setStatus('info', 'Scanner bereit: ' + c.device);
+  if(c.options_error){
+    setStatus('info', 'Scanner bereit: ' + c.device + ' – Geräteoptionen konnten nicht gelesen werden (Scanner belegt?). ADF und Duplex stehen trotzdem bereit.');
+  }else{
+    setStatus('info', 'Scanner bereit: ' + c.device);
+  }
+  if(c.duplex && c.duplex.session) showDuplexPanel(c.duplex);
+}
+
+function adfAvailable(){
+  return (cfg.sources || []).indexOf('ADF') >= 0;
 }
 
 function fillSelect(id, values, def){
@@ -239,9 +252,8 @@ function onSourceChange(){
   const hint = document.getElementById('sourceHint');
   const isAdf = document.getElementById('source').value === 'ADF';
   hint.style.display = isAdf ? 'block' : 'none';
-  document.getElementById('duplexbtn').style.display = isAdf ? 'inline-block' : 'none';
+  document.getElementById('duplexbtn').style.display = adfAvailable() ? 'inline-block' : 'none';
   document.getElementById('prevbtn').disabled = isAdf;
-  if(!isAdf) duplexCancel();
   if(isAdf){
     document.getElementById('format').value = 'pdf';
     document.getElementById('format').disabled = true;
@@ -343,16 +355,36 @@ async function startDuplex(){
   btn.disabled = true; btn.textContent = 'Vorderseiten werden gescannt…';
   setStatus('info', 'Duplex Schritt 1/2: Vorderseiten werden aus dem ADF gezogen…');
   const r = await j('/api/duplex/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  btn.disabled = false; btn.textContent = 'Duplex (2× ADF) – Vorder- & Rückseite';
-  if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
-  duplexSession = r.session;
-  const panel = document.getElementById('duplexpanel');
-  panel.style.display = 'block';
+  btn.textContent = 'Duplex (2× ADF) – Vorder- & Rückseite';
+  if(r.error){
+    // 409 mit session: es liegt noch eine Session mit Vorderseiten bereit
+    if(r.session){ showDuplexPanel(r); return; }
+    btn.disabled = false;
+    setStatus('err', 'Fehler: ' + r.error); return;
+  }
+  showDuplexPanel(r);
+}
+
+function showDuplexPanel(d){
+  duplexSession = d.session;
+  const btn = document.getElementById('duplexbtn');
+  btn.disabled = true;
+  btn.textContent = 'Duplex – Rückseiten ausstehend';
+  const mins = d.ttl ? Math.round(d.ttl / 60) : 15;
+  document.getElementById('duplexpanel').style.display = 'block';
   document.getElementById('duplexmsg').innerHTML =
-    'Schritt 1/2 erledigt: <b>'+r.pages+'</b> Vorderseite'+(r.pages===1?'':'n')+' im ADF gezogen.<br>'+
+    'Schritt 1/2 erledigt: <b>'+d.pages+'</b> Vorderseite'+(d.pages===1?'':'n')+' im ADF gezogen.<br>'+
     'Jetzt den kompletten Stapel <b>umdrehen</b> (ohne Reihenfolge ändern) und wieder in den Einzug legen, '+
-    'dann Rückseiten scannen lassen.';
+    'dann Rückseiten scannen lassen.'+
+    '<div class="meta" style="margin-top:8px">Die Vorderseiten bleiben auch beim Neuladen der Seite erhalten und verfallen nach '+mins+' Minuten.</div>';
   document.getElementById('duplexbackbtn').style.display = 'inline-block';
+  setStatus('info', 'Vorderseiten gescannt: '+d.pages+' Seite'+(d.pages===1?'':'n')+' – Stapel umdrehen und Rückseiten scannen.');
+}
+
+function resetDuplexBtn(){
+  const btn = document.getElementById('duplexbtn');
+  btn.disabled = false;
+  btn.textContent = 'Duplex (2× ADF) – Vorder- & Rückseite';
 }
 
 async function duplexBack(){
@@ -362,10 +394,11 @@ async function duplexBack(){
   setStatus('info', 'Duplex Schritt 2/2: Rückseiten werden aus dem ADF gezogen…');
   const r = await j('/api/duplex/back', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({session: duplexSession})});
-  duplexSession = null;
   btn.disabled = false; btn.textContent = 'Rückseiten scannen';
-  document.getElementById('duplexpanel').style.display = 'none';
   if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
+  duplexSession = null;
+  document.getElementById('duplexpanel').style.display = 'none';
+  resetDuplexBtn();
   lastFile = r.file;
   document.getElementById('singlepanel').style.display='block';
   document.getElementById('dl').href = r.url;
@@ -388,6 +421,7 @@ async function duplexCancel(){
     try{ await j('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({session: s})}); }catch(e){}
   }
   document.getElementById('duplexpanel').style.display = 'none';
+  resetDuplexBtn();
 }
 
 async function nextPage(){
@@ -493,6 +527,7 @@ let autolastShown = 0;
 async function pollAuto(){
   let r;
   try{ r = await j('/api/autoscan'); }catch(e){ return; }
+  document.getElementById('autopause').style.display = (r.enabled && r.paused === 'duplex') ? 'block' : 'none';
   if(r.last && r.last.ts > autolastShown){
     autolastShown = r.last.ts;
     const a = document.getElementById('automsg');
