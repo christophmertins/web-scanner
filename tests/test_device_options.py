@@ -86,7 +86,7 @@ def test_vergifteter_cache_auf_platte_wird_ignoriert(scanner, monkeypatch):
     assert "ADF" in opts["sources"]
 
 
-def test_guter_cache_ueberlebt_belegten_probe(scanner, monkeypatch):
+def test_guter_cache_wird_bei_belegtem_probe_genutzt(scanner, monkeypatch):
     _reset(scanner, monkeypatch, run=_real_run)
     scanner.device_options("test:dev")  # guter Cache
     cached = json.load(open(scanner.OPT_CACHE_FILE))
@@ -97,6 +97,25 @@ def test_guter_cache_ueberlebt_belegten_probe(scanner, monkeypatch):
     monkeypatch.setattr(scanner, "run", _fake_run)
     opts, err = scanner.device_options("test:dev")
 
-    assert err
-    assert not os.path.exists(scanner.OPT_CACHE_FILE), "Guter Cache darf nicht durch leeren ersetzt werden"
+    assert err is None, "Bei belegtem Scanner muss der gute Cache greifen"
+    assert "ADF" in opts["sources"]
     assert "ADF" in cached["opts"]["sources"]
+
+
+class _BusyLock:
+    def acquire(self, timeout=0):
+        return False
+
+    def release(self):
+        pass
+
+
+def test_belegter_scanner_ohne_cache_meldet_fehler(scanner, monkeypatch):
+    _reset(scanner, monkeypatch)
+    monkeypatch.setattr(scanner, "scan_lock", _BusyLock())
+
+    opts, err = scanner.device_options("test:dev")
+
+    assert err
+    assert not opts.get("sources")
+    assert not os.path.exists(scanner.OPT_CACHE_FILE)

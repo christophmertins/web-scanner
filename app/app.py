@@ -70,7 +70,7 @@ duplex_results = {}  # job_id -> fertiges Ergebnis, bis die UI es abgeholt hat
 DEVICE_CACHE = {"ts": 0, "list": []}
 OPT_CACHE_FILE = os.path.join(SCAN_DIR, ".device_options.json")
 OPT_CACHE_TTL = 3600
-OPT_DISK_TTL = 86400
+OPT_DISK_TTL = 7 * 86400  # Geraeteoptionen aendern sich praktisch nie
 # Zeit, die eine Duplex-Session (Vorderseiten gescannt) auf die Rueckseiten wartet.
 # Danach verfaellt sie, damit der Autoscan nicht dauerhaft blockiert bleibt.
 DUPLEX_TTL = int(os.environ.get("DUPLEX_TTL", "900"))
@@ -88,6 +88,41 @@ auto_cfg = {
     "paperless": bool(PAPERLESS_URL),   # ADF-Scans direkt an Paperless senden
 }
 last_ui_settings = {"mode": "Gray", "resolution": 300, "x": 210.0, "y": 297.0}
+
+AUTO_STATE_FILE = os.path.join(SCAN_DIR, ".autoscan.json")
+
+
+def _load_auto_state():
+    """Vom Nutzer gesetzten Autoscan-Zustand ueber Neustarts hinweg behalten."""
+    try:
+        with open(AUTO_STATE_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    if "enabled" in data:
+        auto_cfg["enabled"] = bool(data["enabled"])
+    if "paperless" in data:
+        auto_cfg["paperless"] = bool(data["paperless"])
+    try:
+        if "interval" in data:
+            auto_cfg["interval"] = float(data["interval"])
+    except (TypeError, ValueError):
+        pass
+
+
+def _save_auto_state():
+    try:
+        with open(AUTO_STATE_FILE, "w") as f:
+            json.dump({"enabled": auto_cfg["enabled"],
+                       "interval": auto_cfg["interval"],
+                       "paperless": auto_cfg["paperless"]}, f)
+    except Exception as e:
+        log("autoscan state save failed: %s" % e)
+
+
+_load_auto_state()
 
 MODEL_SLUGS = [
     "officejet_4500_g510g-m",
@@ -297,14 +332,35 @@ def device_options(device):
     if _opt_cache_valid(_opt_cache, device, OPT_CACHE_TTL):
         return _opt_cache["opts"], None
 
-    rc, out, err = run(["scanimage", "-d", device, "--help"], timeout=20)
+    # Selbst ein alter Cache ist besser als gar keine Optionen (ADF/Duplex!).
+    cached = None
+    if _opt_cache.get("device") == device and _options_usable(_opt_cache.get("opts")):
+        cached = _opt_cache["opts"]
+
+    # Probe nur, wenn der Scanner frei ist. Sonst liefert `scanimage --help`
+    # rc=0 mit dem generischen Usage-Text - und waehrend eines Scans ist das
+    # Geraet praktisch immer belegt (Autoscan-Polling).
+    got_lock = scan_lock.acquire(timeout=5)
+    if not got_lock:
+        if cached:
+            log("scanner belegt - nutze gecachte Geraeteoptionen")
+            return cached, None
+        return {}, "Scanner belegt - Geraeteoptionen konnten nicht gelesen werden."
+    try:
+        rc, out, err = run(["scanimage", "-d", device, "--help"], timeout=20)
+    finally:
+        scan_lock.release()
+
     if rc != 0:
+        if cached:
+            return cached, None
         return {}, "scanimage --help failed: %s" % err.strip()
 
     opts = parse_device_options(out)
     if not _options_usable(opts):
-        # Belegtes Geraet: rc=0, aber nur generischer Usage-Text. Nicht cachen.
         log("scanimage --help ohne Geraeteoptionen: %s" % err.strip())
+        if cached:
+            return cached, None
         return {}, "Scanner belegt? Geraeteoptionen nicht lesbar (%s)" % (err.strip() or "keine Angabe")
 
     entry = {"device": device, "ts": time.time(), "opts": opts}
@@ -1239,6 +1295,7 @@ def api_autoscan_set():
             pass
     if "paperless" in data:
         auto_cfg["paperless"] = bool(data["paperless"])
+    _save_auto_state()
     return api_autoscan()
 
 
