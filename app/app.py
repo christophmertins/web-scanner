@@ -66,6 +66,7 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 scan_lock = threading.Lock()
 jobs = {}  # job_id -> {"device":..., "dir":..., "pages": [...]}
 duplex_jobs = {}  # job_id -> {"dir":..., "front_pages": [...], "ts":...}
+duplex_results = {}  # job_id -> fertiges Ergebnis, bis die UI es abgeholt hat
 DEVICE_CACHE = {"ts": 0, "list": []}
 OPT_CACHE_FILE = os.path.join(SCAN_DIR, ".device_options.json")
 OPT_CACHE_TTL = 3600
@@ -73,6 +74,8 @@ OPT_DISK_TTL = 86400
 # Zeit, die eine Duplex-Session (Vorderseiten gescannt) auf die Rueckseiten wartet.
 # Danach verfaellt sie, damit der Autoscan nicht dauerhaft blockiert bleibt.
 DUPLEX_TTL = int(os.environ.get("DUPLEX_TTL", "900"))
+# Wie lange ein fertiges Duplex-Ergebnis fuer die UI abrufbar bleibt
+DUPLEX_RESULT_TTL = int(os.environ.get("DUPLEX_RESULT_TTL", "600"))
 _opt_cache = {"device": None, "ts": 0.0, "opts": None}
 
 # Autoscans: lauffaehiger Background-Poller, der bei Papier im ADF automatisch scannt
@@ -477,6 +480,9 @@ def prune_duplex_jobs(max_age=None):
             shutil_rmtree(j.get("dir") or os.path.join(JOB_DIR, jid))
             duplex_jobs.pop(jid, None)
             log("duplex session %s abgelaufen" % jid)
+    for jid, res in list(duplex_results.items()):
+        if now - res.get("ts", 0) > DUPLEX_RESULT_TTL:
+            duplex_results.pop(jid, None)
 
 
 def pending_duplex():
@@ -612,6 +618,23 @@ def paperless_upload(name, title="", created=""):
     return False, "Paperless antwortete mit Status %s: %s" % (resp.status_code, resp.text[:300]), None
 
 
+def auto_paperless(name):
+    """Fertiges PDF automatisch nach Paperless schieben (wenn konfiguriert).
+
+    Returns Meldung fuer die UI: "" (deaktiviert), "paperless (doc <id>)"
+    oder "Paperless-Fehler: <text>"."""
+    if not name or not name.lower().endswith(".pdf"):
+        return ""
+    if not (auto_cfg["paperless"] and PAPERLESS_URL):
+        return ""
+    ok, err, doc_id = paperless_upload(name)
+    if ok:
+        log("auto -> paperless %s (doc %s)" % (name, doc_id))
+        return "paperless (doc %s)" % doc_id
+    log("auto -> paperless fehlgeschlagen: %s" % err)
+    return "Paperless-Fehler: %s" % err
+
+
 def preview_worker():
     """Hintergrund: Vorschauen fuer neue/geaenderte Dateien vorrendern."""
     scan_history_sync()
@@ -681,25 +704,28 @@ def auto_scan_once():
         fn = os.path.basename(dest)
         auto_cfg["last"] = {"file": fn, "pages": n_pages, "ts": time.time()}
         log("autoscan: %s (%d Seiten)" % (fn, n_pages))
-        if auto_cfg["paperless"] and PAPERLESS_URL:
-            pok, perr, pid = paperless_upload(fn)
-            if pok:
-                log("autoscan -> paperless %s (doc %s)" % (fn, pid))
-            else:
-                log("autoscan -> paperless fehlgeschlagen: %s" % perr)
+        auto_paperless(fn)
         return True
     return False
 
 
 def auto_scan_loop():
     """Background-Loop: pollt den ADF; laeuft gluecklich, wenn Papier eingelegt wird.
-    Backoff bei anhaltend leerem Einzug, sofort schnell nach Erfolg."""
+    Backoff bei anhaltend leerem Einzug, sofort schnell nach Erfolg.
+
+    Liegt eine Duplex-Session auf Rueckseiten, hat sie Vorrang: sobald Papier
+    im Einzug liegt, wird der zweite Durchzug automatisch gestartet."""
     empties = 0
     while True:
         wait = auto_cfg["interval"]
         if empties > 0:
             wait *= min(12, 1 + empties // 4)  # max. ~12x Intervall
         time.sleep(wait)
+        prune_duplex_jobs()
+        if duplex_jobs:
+            if auto_back_once():
+                empties = 0
+            continue
         if not auto_cfg["enabled"]:
             continue
         if auto_scan_once():
@@ -988,6 +1014,15 @@ def api_openapi():
                     "responses": {"200": {"description": "Duplex-PDF erstellt"}, "404": {"description": "Session nicht gefunden"}},
                 },
             },
+            "/api/duplex/status": {
+                "get": {
+                    "summary": "Status einer Duplex-Session (waiting/scanning/done)",
+                    "operationId": "duplexStatus",
+                    "tags": ["Scan"],
+                    "parameters": [{"name": "session", "in": "query", "required": True, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "Status der Session"}, "404": {"description": "Session unbekannt oder abgelaufen"}},
+                },
+            },
             "/api/preview_scan": {
                 "post": {
                     "summary": "Schnell-Vorschau (Low-Res-Scan)",
@@ -1231,12 +1266,14 @@ def api_scan():
         ok, dest, err, n_pages = scan_adf(device, mode, resolution, width_mm, height_mm, fmt)
         if not ok:
             return jsonify({"error": err}), 500
+        fn = os.path.basename(dest)
         return jsonify({
             "success": True,
-            "file": os.path.basename(dest),
-            "url": "/scans/%s" % os.path.basename(dest),
+            "file": fn,
+            "url": "/scans/%s" % fn,
             "adf": True,
             "pages": n_pages,
+            "paperless": auto_paperless(fn),
         })
 
     if fmt == "pdf":
@@ -1299,11 +1336,13 @@ def api_finish():
         pptos_merge_pdf(job["pages"], dest)
     finally:
         shutil_rmtree(job["dir"])
+    fn = os.path.basename(dest)
     return jsonify({
         "success": True,
-        "file": os.path.basename(dest),
-        "url": "/scans/%s" % os.path.basename(dest),
+        "file": fn,
+        "url": "/scans/%s" % fn,
         "pages": len(job["pages"]),
+        "paperless": auto_paperless(fn),
     })
 
 
@@ -1371,36 +1410,36 @@ def api_duplex_start():
     duplex_jobs[jid] = {
         "device": device, "mode": mode, "resolution": resolution,
         "width": width_mm, "height": height_mm,
-        "front_pages": pages, "ts": time.time(),
+        "front_pages": pages, "ts": time.time(), "state": "waiting",
     }
     return jsonify({
         "success": True,
         "session": jid,
         "pages": len(pages),
-        "message": "Vorderseiten gescannt. Stapel umdrehen und erneut einlegen, dann Rueckseiten scannen lassen.",
+        "message": "Vorderseiten gescannt. Stapel umdrehen und einlegen - die Rueckseiten werden automatisch gescannt.",
     })
 
 
-@app.route("/api/duplex/back", methods=["POST"])
-def api_duplex_back():
-    """Schritt 2: Rueckseiten ziehen, mit Vorderseiten verweben und als PDF
-    zusammenfuegen."""
-    ensure_services()
-    data = request.get_json(silent=True) or {}
-    session = str(data.get("session") or "")
+def finish_duplex(session):
+    """Rueckseiten ziehen, mit Vorderseiten verweben, PDF bauen und hochladen.
+
+    Returns (payload, http_status). Bei leerem ADF bleibt die Session bestehen
+    (state wieder "waiting"), damit der Auto-Start weiter versuchen kann."""
     job = duplex_jobs.get(session)
     if not job:
-        return jsonify({"error": "Duplex-Session nicht (mehr) vorhanden."}), 404
-    if not wait_scan_free():
-        return jsonify({"error": "Scanner ist noch beschaeftigt, bitte erneut versuchen."}), 409
+        return {"error": "Duplex-Session nicht (mehr) vorhanden.", "phase": "gone"}, 404
+    if job.get("state") == "scanning":
+        return {"error": "Rückseiten werden bereits gescannt.", "phase": "scanning"}, 409
 
+    job["state"] = "scanning"
     jdir2 = tempfile.mkdtemp(dir=JOB_DIR)
     try:
         ok, back_pages, err = adf_scan_pages(
             job["device"], job["mode"], job["resolution"],
             job["width"], job["height"], jdir2)
         if not ok:
-            return jsonify({"error": err}), 500
+            job["state"] = "waiting"
+            return {"error": err, "phase": "waiting"}, 500
 
         order = weave_duplex(job["front_pages"], back_pages)
         n_front = len(job["front_pages"])
@@ -1408,30 +1447,77 @@ def api_duplex_back():
         try:
             pptos_merge_pdf(order, dest)
         except Exception as e:
-            return jsonify({"error": "PDF-Erstellung fehlgeschlagen: %s" % e}), 500
+            job["state"] = "waiting"
+            return {"error": "PDF-Erstellung fehlgeschlagen: %s" % e, "phase": "waiting"}, 500
 
         fn = os.path.basename(dest)
-        automsg = ""
-        if auto_cfg["paperless"] and PAPERLESS_URL:
-            pok, perr, pid = paperless_upload(fn)
-            if pok:
-                automsg = "paperless (doc %s)" % pid
-                log("duplex -> paperless %s (doc %s)" % (fn, pid))
-            else:
-                log("duplex -> paperless fehlgeschlagen: %s" % perr)
-                automsg = "Paperless-Fehler: %s" % perr
         duplex_jobs.pop(session, None)
-        return jsonify({
+        payload = {
             "success": True,
             "file": fn,
             "url": "/scans/%s" % fn,
             "adf": True,
             "pages": n_front,
             "duplex": True,
-            "paperless": automsg,
-        })
+            "paperless": auto_paperless(fn),
+        }
+        duplex_results[session] = dict(payload, ts=time.time())
+        log("duplex fertig: %s (%d Blaetter)" % (fn, n_front))
+        return payload, 200
     finally:
         shutil_rmtree(jdir2)
+
+
+def auto_back_once():
+    """Rueckseiten automatisch ziehen, sobald Papier im ADF liegt.
+
+    Wird vom Hintergrund-Loop aufgerufen, solange eine Duplex-Session auf ihre
+    Rueckseiten wartet. Leerer Einzug ist kein Fehler: dann bleibt die Session
+    wartend und der naechste Versuch kommt nach dem Backoff."""
+    pending = pending_duplex()
+    if not pending or lock_busy():
+        return False
+    payload, status = finish_duplex(pending["session"])
+    if status == 200:
+        return True
+    return False
+
+
+@app.route("/api/duplex/status")
+def api_duplex_status():
+    """Status einer Duplex-Session fuer die UI (wartend/scannend/fertig)."""
+    session = str(request.args.get("session") or "")
+    prune_duplex_jobs()
+    res = duplex_results.get(session)
+    if res and time.time() - res.get("ts", 0) < DUPLEX_RESULT_TTL:
+        return jsonify(dict(res, phase="done"))
+    job = duplex_jobs.get(session)
+    if job:
+        return jsonify({
+            "phase": job.get("state") or "waiting",
+            "session": session,
+            "pages": len(job.get("front_pages") or []),
+            "ttl": DUPLEX_TTL,
+        })
+    return jsonify({"phase": "gone", "session": session}), 404
+
+
+@app.route("/api/duplex/back", methods=["POST"])
+def api_duplex_back():
+    """Schritt 2 manuell ausloesen (der Auto-Start macht das normalerweise
+    selbst, sobald Papier im Einzug liegt)."""
+    ensure_services()
+    data = request.get_json(silent=True) or {}
+    session = str(data.get("session") or "")
+    if session not in duplex_jobs:
+        return jsonify({"error": "Duplex-Session nicht (mehr) vorhanden."}), 404
+    if not wait_scan_free():
+        return jsonify({"error": "Scanner ist noch beschaeftigt, bitte erneut versuchen."}), 409
+
+    payload, status = finish_duplex(session)
+    if status == 500:
+        payload["error"] = payload.get("error") or "Rückseiten konnten nicht gescannt werden."
+    return jsonify(payload), status
 
 
 def rgb_to_png(path):

@@ -122,6 +122,7 @@ a.download{color:var(--acc);text-decoration:none;font-weight:600}
         <button class="btn btn-ghost" onclick="sendToPaperless()" id="plbtn" style="display:none">An Paperless senden</button>
         <button class="btn btn-ghost" onclick="runOcr()" id="ocrbtn">OCR (Texterkennung)</button>
       </div>
+      <div class="meta" id="plstate" style="display:none;color:var(--ok)"></div>
       <img id="preview" alt="Scan-Vorschau">
       <div id="ocrbox" style="display:none;margin-top:14px">
         <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
@@ -287,6 +288,7 @@ async function startScan(){
   if(cfg.session) return;
   lastFile = null;
   document.getElementById('plbtn').style.display='none';
+  setPaperlessState('');
   document.getElementById('singlepanel').style.display='none';
   document.getElementById('ocrbox').style.display='none';
   const s = document.getElementById('source').value;
@@ -311,9 +313,9 @@ async function startScan(){
     document.getElementById('dl').href = r.url;
     document.getElementById('dl').textContent = 'Download ' + r.file;
     document.getElementById('preview').style.display = 'none';
-    document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+    setPaperlessState(r.paperless);
     document.getElementById('ocrbox').style.display = 'block';
-    setStatus('ok', 'ADF-Scan mit ' + (r.pages||0) + ' Seiten fertig.');
+    setStatus('ok', 'ADF-Scan mit ' + (r.pages||0) + ' Seiten fertig.' + (r.paperless ? ' ' + r.paperless : ''));
     loadHistory();
     return;
   }
@@ -371,20 +373,99 @@ function showDuplexPanel(d){
   btn.disabled = true;
   btn.textContent = 'Duplex – Rückseiten ausstehend';
   const mins = d.ttl ? Math.round(d.ttl / 60) : 15;
-  document.getElementById('duplexpanel').style.display = 'block';
-  document.getElementById('duplexmsg').innerHTML =
-    'Schritt 1/2 erledigt: <b>'+d.pages+'</b> Vorderseite'+(d.pages===1?'':'n')+' im ADF gezogen.<br>'+
-    'Jetzt den kompletten Stapel <b>umdrehen</b> (ohne Reihenfolge ändern) und wieder in den Einzug legen, '+
-    'dann Rückseiten scannen lassen.'+
-    '<div class="meta" style="margin-top:8px">Die Vorderseiten bleiben auch beim Neuladen der Seite erhalten und verfallen nach '+mins+' Minuten.</div>';
+  const panel = document.getElementById('duplexpanel');
+  panel.style.display = 'block';
+  document.getElementById('duplexmsg').innerHTML = duplexWaitingHtml(d.pages, mins);
   document.getElementById('duplexbackbtn').style.display = 'inline-block';
-  setStatus('info', 'Vorderseiten gescannt: '+d.pages+' Seite'+(d.pages===1?'':'n')+' – Stapel umdrehen und Rückseiten scannen.');
+  document.getElementById('duplexbackbtn').disabled = false;
+  setStatus('info', 'Vorderseiten gescannt: '+d.pages+' Seite'+(d.pages===1?'':'n')+' – Stapel umdrehen und einlegen, der Scan startet automatisch.');
+  if(panel.scrollIntoView) panel.scrollIntoView({behavior:'smooth', block:'center'});
+  startDuplexPolling();
+}
+
+function duplexWaitingHtml(pages, mins){
+  return 'Schritt 1/2 erledigt: <b>'+pages+'</b> Vorderseite'+(pages===1?'':'n')+' im ADF gezogen.<br>'+
+    'Jetzt den kompletten Stapel <b>umdrehen</b> (ohne Reihenfolge ändern) und wieder in den Einzug legen – '+
+    'die <b>Rückseiten werden automatisch gescannt</b>, sobald Papier erkannt wird.'+
+    '<div class="meta" style="margin-top:8px">Die Vorderseiten bleiben auch beim Neuladen der Seite erhalten und verfallen nach '+mins+' Minuten.</div>';
 }
 
 function resetDuplexBtn(){
   const btn = document.getElementById('duplexbtn');
   btn.disabled = false;
   btn.textContent = 'Duplex (2× ADF) – Vorder- & Rückseite';
+}
+
+let duplexPoll = null;
+
+function startDuplexPolling(){
+  stopDuplexPolling();
+  duplexPoll = setInterval(pollDuplexStatus, 2000);
+}
+
+function stopDuplexPolling(){
+  if(duplexPoll){ clearInterval(duplexPoll); duplexPoll = null; }
+}
+
+async function pollDuplexStatus(){
+  if(!duplexSession){ stopDuplexPolling(); return; }
+  let r;
+  try{ r = await j('/api/duplex/status?session=' + encodeURIComponent(duplexSession)); }
+  catch(e){ return; }
+  if(r.phase === 'scanning'){
+    if(!duplexSession) return;
+    document.getElementById('duplexbackbtn').disabled = true;
+    document.getElementById('duplexmsg').innerHTML =
+      'Rückseiten werden aus dem ADF gezogen… bitte warten.<div class="meta" style="margin-top:8px">Das PDF wird danach automatisch erstellt und – falls aktiviert – an Paperless gesendet.</div>';
+    setStatus('info', 'Rückseiten werden gescannt…');
+    return;
+  }
+  if(r.phase === 'waiting'){
+    document.getElementById('duplexbackbtn').disabled = false;
+    return;
+  }
+  if(r.phase === 'done'){ showDuplexResult(r); return; }
+  if(r.phase === 'gone'){
+    stopDuplexPolling();
+    duplexSession = null;
+    document.getElementById('duplexpanel').style.display = 'none';
+    resetDuplexBtn();
+    setStatus('err', 'Duplex-Session ist abgelaufen – Vorderseiten bitte neu scannen.');
+  }
+}
+
+function setPaperlessState(msg){
+  const btn = document.getElementById('plbtn');
+  const st = document.getElementById('plstate');
+  const uploaded = !!(msg && msg.indexOf('paperless (doc') === 0);
+  btn.style.display = (paperlessOk && !uploaded) ? 'inline-block' : 'none';
+  if(uploaded){
+    st.style.display = 'block';
+    st.textContent = '✓ Automatisch an Paperless gesendet (' + msg.replace('paperless ', '') + ')';
+  }else{
+    st.style.display = 'none';
+    st.textContent = '';
+  }
+}
+
+function showDuplexResult(r){
+  stopDuplexPolling();
+  duplexSession = null;
+  document.getElementById('duplexpanel').style.display = 'none';
+  resetDuplexBtn();
+  lastFile = r.file;
+  document.getElementById('singlepanel').style.display='block';
+  document.getElementById('dl').href = r.url;
+  document.getElementById('dl').textContent = 'Download ' + r.file;
+  document.getElementById('preview').style.display = 'none';
+  setPaperlessState(r.paperless);
+  document.getElementById('ocrbox').style.display = 'block';
+  setStatus('ok', 'Duplex-Scan mit ' + (r.pages||0) + ' Blättern ('+(r.duplex?'Vorder-/Rückseite): ' : '): ') +
+    'PDF fertig.' + (r.paperless ? ' ' + r.paperless : ''));
+  loadHistory();
+  if(r.paperless && r.paperless.startsWith('Paperless-Fehler')){
+    setStatus('err', r.paperless);
+  }
 }
 
 async function duplexBack(){
@@ -395,26 +476,17 @@ async function duplexBack(){
   const r = await j('/api/duplex/back', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({session: duplexSession})});
   btn.disabled = false; btn.textContent = 'Rückseiten scannen';
-  if(r.error){ setStatus('err', 'Fehler: ' + r.error); return; }
-  duplexSession = null;
-  document.getElementById('duplexpanel').style.display = 'none';
-  resetDuplexBtn();
-  lastFile = r.file;
-  document.getElementById('singlepanel').style.display='block';
-  document.getElementById('dl').href = r.url;
-  document.getElementById('dl').textContent = 'Download ' + r.file;
-  document.getElementById('preview').style.display = 'none';
-  document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
-  document.getElementById('ocrbox').style.display = 'block';
-  setStatus('ok', 'Duplex-Scan mit ' + (r.pages||0) + ' Blättern ('+(r.duplex?'Vorder-/Rückseite): ' : '): ') +
-    'PDF fertig.' + (r.paperless ? ' ' + r.paperless : ''));
-  loadHistory();
-  if(r.paperless && r.paperless.startsWith('Paperless-Fehler')){
-    setStatus('err', r.paperless);
+  if(r.error){
+    // 409: der Auto-Start hat bereits uebernommen; 500: kein Papier/Scannerfehler
+    if(r.phase === 'scanning'){ setStatus('info', 'Rückseiten werden bereits gescannt…'); return; }
+    setStatus('err', 'Fehler: ' + r.error);
+    return;
   }
+  showDuplexResult(r);
 }
 
 async function duplexCancel(){
+  stopDuplexPolling();
   if(duplexSession){
     const s = duplexSession;
     duplexSession = null;
@@ -452,10 +524,13 @@ cfg.session = null;
   document.getElementById('singlepanel').style.display='block';
   document.getElementById('dl').href = r.url;
   document.getElementById('dl').textContent = 'Download ' + r.file;
-  document.getElementById('plbtn').style.display = paperlessOk ? 'inline-block' : 'none';
+  setPaperlessState(r.paperless);
   document.getElementById('ocrbox').style.display = 'block';
-  setStatus('ok', 'PDF mit '+r.pages+' Seiten erstellt.');
+  setStatus('ok', 'PDF mit '+r.pages+' Seiten erstellt.' + (r.paperless ? ' ' + r.paperless : ''));
   loadHistory();
+  if(r.paperless && r.paperless.startsWith('Paperless-Fehler')){
+    setStatus('err', r.paperless);
+  }
 }
 
 async function sendToPaperless(){

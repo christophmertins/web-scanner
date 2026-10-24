@@ -45,13 +45,17 @@ versioniert wird. Gerätespezifische Werte stehen in `docker-compose.yml`.
 | `SCANNER_DEVICE` | Explizite hpaio-Device-URI; leer lassen für Auto-Erkennung |
 | `AUTH_USER` / `AUTH_PASS` | Optional Basic Auth für die Webanwendung |
 | `SCAN_TIMEOUT` | Timeout je Scan in Sekunden (Default 120) |
+| `DUPLEX_TTL` | Wartezeit auf die Rückseiten in Sekunden (Default 900) |
 | `PAPERLESS_URL` | Basis-URL der Paperless-ngx Instanz (ohne Trailing-Slash) |
 | `PAPERLESS_TOKEN` | Paperless API-Token (Profil → Authentifizierungstoken) |
 
-Paperless: Nach einem Scan erscheint der Button „An Paperless senden“
-(Upload über die Paperless-API; je moderat, danach übernimmt Paperless OCR/Ablage).
-Konfiguriert ist eine `PAPERLESS_URL` (valid
-Let's-Encrypt-Wildcard-Cert über den lokalen nginx-proxy).
+Duplex: Nach dem Vorderseiten-Durchzug wird der Stapel umgedreht und eingelegt;
+der Rückseiten-Scan startet automatisch, sobald Papier im Einzug liegt.
+Wartet länger als `DUPLEX_TTL`, verfällt die Session.
+
+Paperless: Fertige PDFs (Duplex, ADF-Scan, „PDF speichern“) werden bei
+konfigurierter `PAPERLESS_URL` automatisch hochgeladen; der manuelle Button
+bleibt für Dateien ohne Auto-Upload.
 
 Datum der Device-URI enthält ein `&` -> in YAML als `&amp;` escapen.
 
